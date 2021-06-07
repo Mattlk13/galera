@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2019 Codership Oy <info@codership.com>
+ * Copyright (C) 2008-2020 Codership Oy <info@codership.com>
  *
  * $Id$
  */
@@ -126,7 +126,10 @@ group_nodes_init (const gcs_group_t* group, const gcs_comp_msg_t* comp)
 }
 
 /* Free nodes array */
-static void
+#ifndef GCS_CORE_TESTING
+static
+#endif // GCS_CORE_TESTING
+void
 group_nodes_free (gcs_group_t* group)
 {
     int i;
@@ -188,7 +191,8 @@ group_redo_last_applied (gcs_group_t* group)
                      GCS_NODE_STATE_DONOR  == node->status);
         }
 
-//        gu_debug ("last_applied[%ld]: %lld", n, seqno);
+//        gu_debug("redo_last_applied[%ld]: %lld, count: %s",
+//                 n, seqno, count ? "yes" : "no");
 
         /* NOTE: It is crucial for consistency that last_applied algorithm
          *       is absolutely identical on all nodes. Therefore for the
@@ -348,10 +352,11 @@ group_post_state_exchange (gcs_group_t* group)
             {
                 gu_fatal("Reversing history: %lld -> %lld, this member has "
                          "applied %lld more events than the primary component."
-                         "Data loss is possible. Aborting.",
+                         "Data loss is possible. Must abort.",
                          (long long)group->act_id_, (long long)quorum->act_id,
                          (long long)(group->act_id_ - quorum->act_id));
-                gu_abort();
+                group->state  = GCS_GROUP_INCONSISTENT;
+                return;
             }
             group->state      = GCS_GROUP_PRIMARY;
             group->act_id_    = quorum->act_id;
@@ -1420,6 +1425,10 @@ group_select_donor (gcs_group_t* group,
 void
 gcs_group_ignore_action (gcs_group_t* group, struct gcs_act_rcvd* act)
 {
+    gu_debug("Ignoring action: buf: %p, len: %zd, type: %d, sender: %d, "
+             "seqno: %lld", act->act.buf, act->act.buf_len, act->act.type,
+             act->sender_idx, act->id);
+
     if (act->act.type <= GCS_ACT_STATE_REQ) {
         gcs_gcache_free (group->cache, act->act.buf);
     }
@@ -1457,23 +1466,47 @@ gcs_group_handle_state_request (gcs_group_t*         group,
     gcs_seqno_t ist_seqno = GCS_SEQNO_ILL;
     int str_version = 1; // actually it's 0 or 1.
 
-    if (act->act.buf_len != (ssize_t)(donor_name_len + 1) &&
+    if (act->act.buf_len > (ssize_t)(donor_name_len + 2) &&
         donor_name[donor_name_len + 1] == 'V') {
         str_version = (int)donor_name[donor_name_len + 2];
     }
 
     if (str_version >= 2) {
-        const char* ist_buf = donor_name + donor_name_len + 3;
+        ssize_t const ist_offset(donor_name_len + 3);
+        ssize_t const sst_offset
+            (ist_offset + sizeof(ist_uuid) + sizeof(ist_seqno));
+
+        if (act->act.buf_len < sst_offset)
+        {
+            if (group->my_idx == joiner_idx)
+            {
+                gu_fatal("Failed to form State Transfer Request: %zd < %zd. "
+                         "Internal program error.",
+                         act->act.buf_len, sst_offset);
+                act->id = -ENOTRECOVERABLE;
+                return act->act.buf_len;
+            }
+            else
+            {
+                gu_warn("Malformed State Transfer Request from %d.%d (%s): "
+                        "%zd < %zd. Ignoring.",
+                        joiner_idx, group->nodes[joiner_idx].segment,
+                        joiner_name);
+                gcs_group_ignore_action(group, act);
+                return 0;
+            }
+        }
+
+        const char* ist_buf = donor_name + ist_offset;
         memcpy(&ist_uuid, ist_buf, sizeof(ist_uuid));
         ist_seqno = gcs_seqno_gtoh(*(gcs_seqno_t*)(ist_buf + sizeof(ist_uuid)));
 
         // change act.buf's content to original version.
         // and it's safe to change act.buf_len
-        size_t head = donor_name_len + 3 + sizeof(ist_uuid) + sizeof(ist_seqno);
         memmove((char*)act->act.buf + donor_name_len + 1,
-                (char*)act->act.buf + head,
-                act->act.buf_len - head);
-        act->act.buf_len -= sizeof(ist_uuid) + sizeof(ist_seqno) + 2;
+                (char*)act->act.buf + sst_offset,
+                act->act.buf_len - sst_offset);
+        act->act.buf_len -= sst_offset - donor_name_len - 1;
     }
 
     assert (GCS_ACT_STATE_REQ == act->act.type);
@@ -1483,16 +1516,27 @@ gcs_group_handle_state_request (gcs_group_t*         group,
         const char* joiner_status_string = gcs_node_state_to_str(joiner_status);
 
         if (group->my_idx == joiner_idx) {
-            gu_error ("Requesting state transfer while in %s. "
-                      "Ignoring.", joiner_status_string);
-            act->id = -ECANCELED;
+            if (joiner_status >= GCS_NODE_STATE_JOINED)
+            {
+                gu_warn ("Requesting state transfer while in %s. "
+                         "Ignoring.", joiner_status_string);
+                act->id = -ECANCELED;
+            }
+            else
+            {
+                /* The node can't send two STRs in a row */
+                assert(joiner_status == GCS_NODE_STATE_JOINER);
+                gu_fatal("Requesting state transfer while in %s. "
+                         "Internal program error.", joiner_status_string);
+                act->id = -ENOTRECOVERABLE;
+            }
             return act->act.buf_len;
         }
         else {
-            gu_error ("Member %d.%d (%s) requested state transfer, "
-                      "but its state is %s. Ignoring.",
-                      joiner_idx, group->nodes[joiner_idx].segment, joiner_name,
-                      joiner_status_string);
+            gu_warn ("Member %d.%d (%s) requested state transfer, "
+                     "but its state is %s. Ignoring.",
+                     joiner_idx, group->nodes[joiner_idx].segment, joiner_name,
+                     joiner_status_string);
             gcs_group_ignore_action (group, act);
             return 0;
         }
