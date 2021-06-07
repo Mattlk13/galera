@@ -1,15 +1,15 @@
-// Copyright (C) 2007-2012 Codership Oy <info@codership.com>
+// Copyright (C) 2007-2017 Codership Oy <info@codership.com>
 
 // $Id$
 
 #include <stdio.h>  // printf()
 #include <string.h> // strcmp()
 #include <stdlib.h> // EXIT_SUCCESS | EXIT_FAILURE
+#include <unistd.h> // unlink()
 #include <check.h>
 
 #include "../src/gu_conf.h"
 #include "gu_mem_test.h"
-#include "gu_vec_test.h"
 #include "gu_bswap_test.h"
 #include "gu_fnv_test.h"
 #include "gu_mmh3_test.h"
@@ -29,7 +29,6 @@ typedef Suite *(*suite_creator_t)(void);
 static suite_creator_t suites[] =
     {
         gu_mem_suite,
-        gu_vec_suite,
         gu_bswap_suite,
         gu_fnv_suite,
         gu_mmh3_suite,
@@ -46,6 +45,8 @@ static suite_creator_t suites[] =
         NULL
     };
 
+#define LOG_FILE "gu_tests.log"
+
 int main(int argc, char* argv[])
 {
   int no_fork = ((argc > 1) && !strcmp(argv[1], "nofork")) ? 1 : 0;
@@ -55,7 +56,7 @@ int main(int argc, char* argv[])
   FILE* log_file = NULL;
   
   if (!no_fork) {
-      log_file = fopen ("gu_tests.log", "w");
+      log_file = fopen (LOG_FILE, "w");
       if (!log_file) return EXIT_FAILURE;
       gu_conf_set_log_file (log_file);
   }
@@ -74,6 +75,9 @@ int main(int argc, char* argv[])
   {
       fclose (log_file);
   }
+
+  if (0 == failed && NULL != log_file) unlink(LOG_FILE);
+
   printf ("Total tests failed: %d\n", failed);
   return (failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

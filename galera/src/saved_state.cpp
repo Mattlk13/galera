@@ -1,16 +1,16 @@
 //
-// Copyright (C) 2012 Codership Oy <info@codership.com>
+// Copyright (C) 2012-2018 Codership Oy <info@codership.com>
 //
 
 #include "saved_state.hpp"
 #include "gu_dbug.h"
 #include "uuid.hpp"
+#include "gu_inttypes.hpp"
 
 #include <fstream>
 
-#define __STDC_FORMAT_MACROS
-#include <inttypes.h>
 #include <sys/file.h>
+#include <fcntl.h>
 
 namespace galera
 {
@@ -20,6 +20,7 @@ namespace galera
 
 SavedState::SavedState  (const std::string& file) :
     fs_           (0),
+    filename_     (file),
     uuid_         (WSREP_UUID_UNDEFINED),
     seqno_        (WSREP_SEQNO_UNDEFINED),
     safe_to_bootstrap_(true),
@@ -43,9 +44,9 @@ SavedState::SavedState  (const std::string& file) :
         log_warn << "Could not open state file for reading: '" << file << '\'';
     }
 
-    fs_ = fopen(file.c_str(), "a");
+    FILE* fs_tmp_ = fopen(file.c_str(), "a");
 
-    if (!fs_)
+    if (!fs_tmp_)
     {
         gu_throw_error(errno)
             << "Could not open state file for writing: '" << file
@@ -54,10 +55,17 @@ SavedState::SavedState  (const std::string& file) :
 
     // We take exclusive lock on state file in order to avoid possibility
     // of two Galera replicators sharing the same state file.
-    if (flock(fileno(fs_), LOCK_EX|LOCK_NB))
+    struct flock flck;
+    flck.l_start  = 0;
+    flck.l_len    = 0;
+    flck.l_type   = F_WRLCK;
+    flck.l_whence = SEEK_SET;
+
+    if (::fcntl(fileno(fs_tmp_), F_SETLK, &flck))
     {
-        log_warn << "Could not get exclusive lock on state file: " << file;
-        return;
+        gu_throw_error(errno)
+            << "Could not get exclusive lock on state file: " << file
+            << ". Ensure no other instance is using the same state file";
     }
 
     std::string version("0.8");
@@ -105,7 +113,7 @@ SavedState::SavedState  (const std::string& file) :
     }
 
     log_info << "Found saved state: " << uuid_ << ':' << seqno_
-             << ", safe_to_bootsrap: " << safe_to_bootstrap_;
+             << ", safe_to_bootstrap: " << safe_to_bootstrap_;
 
 #if 0 // we'll probably have it legal
     if (seqno_ < 0 && uuid_ != WSREP_UUID_UNDEFINED)
@@ -118,17 +126,26 @@ SavedState::SavedState  (const std::string& file) :
 
     written_uuid_ = uuid_;
 
-    current_len_ = ftell (fs_);
+    current_len_ = ftell (fs_tmp_);
     log_debug << "Initialized current_len_ to " << current_len_;
     if (current_len_ <= MAX_SIZE)
     {
-        fs_ = freopen (file.c_str(), "r+", fs_);
+        fs_ = freopen (file.c_str(), "r+", fs_tmp_);
     }
     else // normalize file contents
     {
-        fs_ = freopen (file.c_str(), "w+", fs_); // truncate
+        fs_ = freopen (file.c_str(), "w+", fs_tmp_); // truncate
         current_len_ = 0;
         set (uuid_, seqno_, safe_to_bootstrap_);
+    }
+
+    /* freopen will not retain the lock taken on the original fd.
+    Re-obtain the lock. */
+    if (::fcntl(fileno(fs_), F_SETLK, &flck))
+    {
+        gu_throw_error(errno)
+            << "Could not get exclusive lock on state file: " << file
+            << ". Ensure no other instance is using the same state file";
     }
 }
 
@@ -136,10 +153,18 @@ SavedState::~SavedState ()
 {
     if (fs_)
     {
-        if (flock(fileno(fs_), LOCK_UN) != 0)
+        // Closing file descriptor should release the lock, but still...
+        struct flock flck;
+        flck.l_start  = 0;
+        flck.l_len    = 0;
+        flck.l_type   = F_UNLCK;
+        flck.l_whence = SEEK_SET;
+
+        if (::fcntl(fileno(fs_), F_SETLK, &flck))
         {
-            log_error << "Could not unlock saved state file.";
+            log_warn << "Could not unlock state file: " << ::strerror(errno);
         }
+
         fclose(fs_);
     }
 }
@@ -169,7 +194,7 @@ SavedState::set (const wsrep_uuid_t& u, wsrep_seqno_t s, bool safe_to_bootstrap)
        safe_to_bootstrap_ = safe_to_bootstrap;
 
        if (0 == unsafe_())
-          write_and_flush (u, s, safe_to_bootstrap);
+          write_file (u, s, safe_to_bootstrap);
        else
           log_debug << "Not writing state: unsafe counter is " << unsafe_();
     }
@@ -193,8 +218,8 @@ SavedState::mark_unsafe()
 
         if (written_uuid_ != WSREP_UUID_UNDEFINED)
         {
-            write_and_flush (WSREP_UUID_UNDEFINED, WSREP_SEQNO_UNDEFINED,
-                             safe_to_bootstrap_);
+            write_file (WSREP_UUID_UNDEFINED, WSREP_SEQNO_UNDEFINED,
+                        safe_to_bootstrap_);
         }
     }
 }
@@ -216,7 +241,7 @@ SavedState::mark_safe()
             assert(false == corrupt_);
             /* this will write down proper seqno if set() was called too early
              * (in unsafe state) */
-            write_and_flush (uuid_, seqno_, safe_to_bootstrap_);
+            write_file (uuid_, seqno_, safe_to_bootstrap_);
         }
     }
 }
@@ -236,13 +261,13 @@ SavedState::mark_corrupt()
     seqno_ = WSREP_SEQNO_UNDEFINED;
     corrupt_ = true;
 
-    write_and_flush (WSREP_UUID_UNDEFINED, WSREP_SEQNO_UNDEFINED,
-                     safe_to_bootstrap_);
+    write_file (WSREP_UUID_UNDEFINED, WSREP_SEQNO_UNDEFINED,
+                safe_to_bootstrap_);
 }
 
 void
-SavedState::write_and_flush(const wsrep_uuid_t& u, const wsrep_seqno_t s,
-                            bool safe_to_bootstrap)
+SavedState::write_file(const wsrep_uuid_t& u, const wsrep_seqno_t s,
+                       bool safe_to_bootstrap)
 {
     assert (current_len_ <= MAX_SIZE);
 
@@ -265,8 +290,24 @@ SavedState::write_and_flush(const wsrep_uuid_t& u, const wsrep_seqno_t s,
             buf[write_size] = ' '; // overwrite whatever is there currently
 
         rewind(fs_);
-        fwrite(buf, write_size, 1, fs_);
-        fflush(fs_);
+
+        if (fwrite(buf, write_size, 1, fs_) == 0) {
+            log_warn << "write file(" << filename_ << ") failed("
+                     << strerror(errno) << ")";
+            return;
+        }
+
+        if (fflush(fs_) != 0) {
+            log_warn << "fflush file(" << filename_ << ") failed("
+                     << strerror(errno) << ")";
+            return;
+        }
+
+        if (fsync(fileno(fs_)) < 0) {
+            log_warn << "fsync file(" << filename_ << ") failed("
+                     << strerror(errno) << ")";
+            return;
+        }
 
         current_len_ = state_len;
         written_uuid_ = u;

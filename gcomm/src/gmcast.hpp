@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2014 Codership Oy <info@codership.com>
+ * Copyright (C) 2009-2019 Codership Oy <info@codership.com>
  */
 
 /*
@@ -45,7 +45,8 @@ namespace gcomm
         void handle_stable_view(const View& view);
         void handle_evict(const UUID& uuid);
         std::string handle_get_address(const UUID& uuid) const;
-        bool set_param(const std::string& key, const std::string& val);
+        bool set_param(const std::string& key, const std::string& val,
+                       Protolay::sync_param_cb_t& sync_param_cb);
         // Transport interface
         const UUID& uuid() const { return my_uuid_; }
         SegmentId segment() const { return segment_; }
@@ -63,6 +64,13 @@ namespace gcomm
             gu_throw_fatal << "gmcast transport listen not implemented";
         }
 
+        // Configured listen address
+        std::string configured_listen_addr() const
+        {
+            return listen_addr_;
+        }
+
+        // Listen adddress obtained from listening socket.
         std::string listen_addr() const
         {
             if (listener_ == 0)
@@ -125,7 +133,7 @@ namespace gcomm
 
             void set_last_connect()
             {
-                last_connect_ = gu::datetime::Date::now();
+                last_connect_ = gu::datetime::Date::monotonic();
             }
 
             const gu::datetime::Date& last_connect() const
@@ -183,12 +191,26 @@ namespace gcomm
         AddrList          remote_addrs_;
         AddrList          addr_blacklist_;
         bool              relaying_;
-        bool              isolate_;
+        int               isolate_;
+        bool              prim_view_reached_;
 
         gmcast::ProtoMap*  proto_map_;
-        std::set<Socket*>   relay_set_;
+        struct RelayEntry
+        {
+            gmcast::Proto* proto;
+            gcomm::Socket* socket;
+            RelayEntry(gmcast::Proto* p, gcomm::Socket* s)
+                : proto(p), socket(s) { }
+            bool operator<(const RelayEntry& other) const
+            {
+                return (socket < other.socket);
+            }
+        };
+        void send(const RelayEntry&, int segment, gcomm::Datagram& dg);
+        typedef std::set<RelayEntry> RelaySet;
+        RelaySet relay_set_;
 
-        typedef std::vector<Socket*> Segment;
+        typedef std::vector<RelayEntry> Segment;
         typedef std::map<uint8_t, Segment> SegmentMap;
         SegmentMap segment_map_;
         // self index in local segment when ordered by UUID
@@ -199,6 +221,48 @@ namespace gcomm
         int                  max_initial_reconnect_attempts_;
         gu::datetime::Date next_check_;
         gu::datetime::Date handle_timers();
+
+        // Grant Proto access to private helper methods.
+        friend class gcomm::gmcast::Proto;
+
+        /*
+         * Checks if the proto is a remote connection point for
+         * locally originated connection. The proto
+         * is required to have gone through initial handshake
+         * sequence so that the remote endpoint UUID is known.
+         *
+         * @param proto Protocol entry
+         *
+         * @return True if matching entry was found and blacklisted,
+         *         false otherwise.
+         */
+        bool is_own(const gmcast::Proto *proto) const;
+
+        /*
+         * Add a proto entry to blacklist. After calling this reconnect
+         * attempts to remote endpoint corresponding to proto are
+         * disabled.
+         *
+         * @param proto Proto entry to be blacklisted.
+         */
+        void blacklist(const gmcast::Proto* proto);
+
+        /*
+         * Check if the proto entry is not originated from own
+         * connection and there already is a proto entry with
+         * the same remote UUID but with different address.
+         *
+         * It is required that the proto has received handshake
+         * message from remote endpoint so that the remote
+         * endpoint identity is known.
+         *
+         */
+        bool is_not_own_and_duplicate_exists(const gmcast::Proto* proto) const;
+
+        /**
+         * Return boolean denoting if the primary view has been reached.
+         */
+        bool prim_view_reached() const { return prim_view_reached_; }
 
         // Erase ProtoMap entry in a safe way so that all lookup lists
         // become properly updated.

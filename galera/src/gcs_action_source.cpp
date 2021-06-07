@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2010-2014 Codership Oy <info@codership.com>
+// Copyright (C) 2010-2020 Codership Oy <info@codership.com>
 //
 
 #include "replicator.hpp"
@@ -102,7 +102,6 @@ void galera::GcsActionSource::dispatch(void* const              recv_ctx,
                                        const struct gcs_action& act,
                                        bool&                    exit_loop)
 {
-    assert(recv_ctx != 0);
     assert(act.buf != 0);
     assert(act.seqno_l > 0);
 
@@ -179,6 +178,11 @@ ssize_t galera::GcsActionSource::process(void* recv_ctx, bool& exit_loop)
         ++received_;
         received_bytes_ += rc;
         gu_trace(dispatch(recv_ctx, act, exit_loop));
+    }
+    else if (GCS_ACT_INCONSISTENCY == act.type)
+    {
+        assert(0 == rc);
+        rc = INCONSISTENCY_CODE;
     }
     return rc;
 }

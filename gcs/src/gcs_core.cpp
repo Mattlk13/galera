@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2016 Codership Oy <info@codership.com>
+ * Copyright (C) 2008-2020 Codership Oy <info@codership.com>
  *
  * $Id$
  *
@@ -97,6 +97,7 @@ core_act_t;
 typedef struct causal_act
 {
     gcs_seqno_t* act_id;
+    long*        error;
     gu_mutex_t*  mtx;
     gu_cond_t*   cond;
 } causal_act_t;
@@ -356,7 +357,7 @@ gcs_core_send (gcs_core_t*          const conn,
         size_t to_copy = chunk_size;
 
         while (to_copy > 0) {        // gather action bufs into one
-            if (to_copy < left) {
+            if (to_copy <= left) {
                 memcpy (dst, ptr, to_copy);
                 ptr     += to_copy;
                 left    -= to_copy;
@@ -554,7 +555,7 @@ core_handle_act_msg (gcs_core_t*          core,
 #else
             assert (NULL == act->act.buf);
 #endif
-            act->sender_idx = msg->sender_idx;
+            assert(act->sender_idx == msg->sender_idx);
 
             if (gu_likely(!my_msg)) {
                 /* foreign action, must be passed from gcs_group */
@@ -699,6 +700,17 @@ core_handle_last_msg (gcs_core_t*          core,
     return 0;
 }
 
+/*! Common things to do on detected inconsistency */
+static int
+core_handle_inconsistency(gcs_core_t* core, struct gcs_act* act)
+{
+    core->state  = CORE_NON_PRIMARY;
+    act->buf     = NULL;
+    act->buf_len = 0;
+    act->type    = GCS_ACT_INCONSISTENCY;
+    return -ENOTRECOVERABLE;
+}
+
 /*!
  * Helper for gcs_core_recv(). Handles GCS_MSG_COMPONENT.
  *
@@ -715,7 +727,8 @@ core_handle_comp_msg (gcs_core_t*          core,
     assert (GCS_MSG_COMPONENT == msg->type);
 
     if (msg->size < (ssize_t)sizeof(gcs_comp_msg_t)) {
-        gu_error ("Malformed component message. Ignoring");
+        gu_error ("Malformed component message (size %zd < %zd). Ignoring",
+                  msg->size, sizeof(gcs_comp_msg_t));
         return 0;
     }
 
@@ -807,11 +820,15 @@ core_handle_comp_msg (gcs_core_t*          core,
         }
         assert (ret == act->buf_len || ret < 0);
         break;
+    case GCS_GROUP_INCONSISTENT:
+        ret = core_handle_inconsistency(core, act);
+        break;
     case GCS_GROUP_WAIT_STATE_MSG:
         gu_fatal ("Internal error: gcs_group_handle_comp() returned "
                   "WAIT_STATE_MSG. Can't continue.");
         ret = -ENOTRECOVERABLE;
         assert(0);
+        // fall through
     default:
         gu_fatal ("Failed to handle component message: %d (%s)!",
                   ret, strerror (-ret));
@@ -940,6 +957,9 @@ core_handle_state_msg (gcs_core_t*          core,
             // waiting for more state messages
             ret = 0;
             break;
+        case GCS_GROUP_INCONSISTENT:
+            ret = core_handle_inconsistency(core, act);
+            break;
         default:
             assert (ret < 0);
             gu_error ("Failed to handle state message: %d (%s)",
@@ -961,7 +981,7 @@ core_handle_state_msg (gcs_core_t*          core,
 static ssize_t
 core_msg_to_action (gcs_core_t*          core,
                     struct gcs_recv_msg* msg,
-                    struct gcs_act*      act)
+                    struct gcs_act_rcvd* rcvd)
 {
     ssize_t      ret = 0;
     gcs_group_t* group = &core->group;
@@ -982,6 +1002,8 @@ core_msg_to_action (gcs_core_t*          core,
                 // See #165.
                 // There is nobody to pass this error to for graceful shutdown:
                 // application thread is blocked waiting for SST.
+                // Also note that original ret value is not preserved on return
+                // so this must be done here.
                 gu_abort();
             }
             act_type = GCS_ACT_JOIN;
@@ -991,13 +1013,17 @@ core_msg_to_action (gcs_core_t*          core,
             act_type = GCS_ACT_SYNC;
             break;
         default:
-            gu_error ("Iternal error. Unexpected message type %s from ld%",
+            gu_error ("Iternal error. Unexpected message type %s from %ld",
                       gcs_msg_type_string[msg->type], msg->sender_idx);
             assert (0);
             ret = -EPROTO;
         }
 
-        if (ret > 0) {
+        if (ret != 0) {
+            if      (ret > 0) rcvd->id = 0;
+            else if (ret < 0) rcvd->id = ret;
+
+            struct gcs_act* const act(&rcvd->act);
             act->type    = act_type;
             act->buf     = msg->buf;
             act->buf_len = msg->size;
@@ -1015,33 +1041,41 @@ core_msg_to_action (gcs_core_t*          core,
 static long core_msg_causal(gcs_core_t* conn,
                             struct gcs_recv_msg* msg)
 {
-    causal_act_t* act;
-    if (gu_unlikely(msg->size != sizeof(*act)))
+    if (gu_unlikely(msg->size != sizeof(causal_act_t)))
     {
         gu_error("invalid causal act len %ld, expected %ld",
-                 msg->size, sizeof(*act));
+                 msg->size, sizeof(causal_act_t));
         return -EPROTO;
     }
 
-    gcs_seqno_t const causal_seqno =
-        GCS_GROUP_PRIMARY == conn->group.state ?
-        conn->group.act_id_ : GCS_SEQNO_ILL;
-
-    act = (causal_act_t*)msg->buf;
+    causal_act_t* act= (causal_act_t*)msg->buf;
     gu_mutex_lock(act->mtx);
-    *act->act_id = causal_seqno;
-    gu_cond_signal(act->cond);
+    {
+        switch (conn->group.state)
+        {
+        case GCS_GROUP_PRIMARY:
+            *act->act_id = conn->group.act_id_;
+            break;
+        case GCS_GROUP_WAIT_STATE_UUID:
+        case GCS_GROUP_WAIT_STATE_MSG:
+            *act->error = -EAGAIN;
+            break;
+        default:
+            *act->error = -EPERM;
+        }
+
+        gu_cond_signal(act->cond);
+    }
     gu_mutex_unlock(act->mtx);
+
     return msg->size;
 }
 
 /*! Receives action */
 ssize_t gcs_core_recv (gcs_core_t*          conn,
                        struct gcs_act_rcvd* recv_act,
-                       long long            timeout,
-                       bool*                sync_sent_ref)
+                       long long            timeout)
 {
-//    struct gcs_act_rcvd  recv_act;
     struct gcs_recv_msg* recv_msg = &conn->recv_msg;
     ssize_t              ret      = 0;
 
@@ -1083,37 +1117,23 @@ ssize_t gcs_core_recv (gcs_core_t*          conn,
         case GCS_MSG_COMPONENT:
             ret = core_handle_comp_msg (conn, recv_msg, &recv_act->act);
             // assert (ret >= 0); // hang on error in debug mode
-            assert (ret == recv_act->act.buf_len || ret <= 0);
+            assert (ret == recv_act->act.buf_len || ret < 0);
             break;
         case GCS_MSG_STATE_UUID:
             ret = core_handle_uuid_msg (conn, recv_msg);
             // assert (ret >= 0); // hang on error in debug mode
-            ret = 0;           // continue waiting for state messages
+            ret = 0;              // continue waiting for state messages
             break;
         case GCS_MSG_STATE_MSG:
             ret = core_handle_state_msg (conn, recv_msg, &recv_act->act);
-            assert (ret >= 0); // hang on error in debug mode
-            assert (ret == recv_act->act.buf_len);
+            //assert (ret >= 0); // hang on error in debug mode
+            assert (ret == recv_act->act.buf_len || ret < 0);
             break;
         case GCS_MSG_JOIN:
         case GCS_MSG_SYNC:
         case GCS_MSG_FLOW:
-            ret = core_msg_to_action (conn, recv_msg, &recv_act->act);
+            ret = core_msg_to_action (conn, recv_msg, recv_act);
             assert (ret == recv_act->act.buf_len || ret <= 0);
-            if (ret == -1) {
-                /* This is to flag transition of node from JOINED -> DONOR.
-                Generally node goes from DONOR -> JOINED -> SYNCED but if
-                parallel desync request is recieved while node is in JOINED
-                state and it is processed before SYNCED message then node
-                can go from JOINED to DONOR state by-passing SYNCED state.
-                In such case we need to ignore SYNC request that is lying
-                from previous state transition and reset sync_sent so that
-                connection restart sending the request. */
-                if (sync_sent_ref) {
-                    *sync_sent_ref = false;
-                }
-                ret = 0;
-            }
             break;
         case GCS_MSG_CAUSAL:
             ret = core_msg_causal(conn, recv_msg);
@@ -1135,7 +1155,7 @@ out:
 
     assert (ret || GCS_ACT_ERROR == recv_act->act.type);
     assert (ret == recv_act->act.buf_len || ret < 0);
-    assert (recv_act->id       <= GCS_SEQNO_ILL ||
+    assert (recv_act->id       <= 0 ||
             recv_act->act.type == GCS_ACT_TORDERED ||
             recv_act->act.type == GCS_ACT_STATE_REQ); // <- dirty hack
     assert (recv_act->sender_idx >= 0 ||
@@ -1153,7 +1173,10 @@ out:
 
         if (-ENOTRECOVERABLE == ret) {
             conn->backend.close(&conn->backend);
-            gu_abort();
+            if (GCS_ACT_INCONSISTENCY != recv_act->act.type) {
+                /* inconsistency event must be passed up */
+                gu_abort();
+            }
         }
     }
 
@@ -1333,20 +1356,22 @@ gcs_core_send_fc (gcs_core_t* core, const void* fc, size_t fc_size)
     return ret;
 }
 
-gcs_seqno_t
-gcs_core_caused(gcs_core_t* core)
+long
+gcs_core_caused (gcs_core_t* core, gcs_seqno_t& seqno)
 {
-    long         ret;
-    gcs_seqno_t  act_id = GCS_SEQNO_ILL;
+    long         error = 0;
     gu_mutex_t   mtx;
     gu_cond_t    cond;
-    causal_act_t act = {&act_id, &mtx, &cond};
+    causal_act_t act = {&seqno, &error, &mtx, &cond};
 
     gu_mutex_init (&mtx, NULL);
     gu_cond_init  (&cond, NULL);
     gu_mutex_lock (&mtx);
     {
-        ret = core_msg_send_retry (core, &act, sizeof(act), GCS_MSG_CAUSAL);
+        long ret = core_msg_send_retry (core,
+                                        &act,
+                                        sizeof(act),
+                                        GCS_MSG_CAUSAL);
 
         if (ret == sizeof(act))
         {
@@ -1355,14 +1380,14 @@ gcs_core_caused(gcs_core_t* core)
         else
         {
             assert (ret < 0);
-            act_id = ret;
+            error = ret;
         }
     }
     gu_mutex_unlock  (&mtx);
     gu_mutex_destroy (&mtx);
     gu_cond_destroy  (&cond);
 
-    return act_id;
+    return error;
 }
 
 long

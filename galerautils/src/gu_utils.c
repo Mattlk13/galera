@@ -28,12 +28,15 @@ gu_str2ll (const char* str, long long* ll)
     case 't':
     case 'T':
         shift += 10;
+        /* fall through */
     case 'g':
     case 'G':
         shift += 10;
+        /* fall through */
     case 'm':
     case 'M':
         shift += 10;
+        /* fall through */
     case 'k':
     case 'K':
         shift += 10;
@@ -47,6 +50,7 @@ gu_str2ll (const char* str, long long* ll)
             else llret = LLONG_MIN;
             errno = ERANGE;
         }
+        /* fall through */
     default:
         *ll = llret;
     }
@@ -65,8 +69,8 @@ gu_str2dbl (const char* str, double* dbl)
 const char*
 gu_str2bool (const char* str, bool* b)
 {
-    size_t len = strlen(str);
-    int    res = -1; /* no conversion */
+    size_t const len = strlen(str);
+    int res = -1; /* no conversion */
 
     switch (len)
     {
@@ -78,17 +82,20 @@ gu_str2bool (const char* str, bool* b)
         }
         break;
     case 2:
-        if (!strcasecmp(str, "on")) res = 1;
-        if (!strcasecmp(str, "no")) res = 0;
+        if      (!strcasecmp(str, "on")) res = 1;
+        else if (!strcasecmp(str, "no")) res = 0;
         break;
     case 3:
-        if (!strcasecmp(str, "off")) res = 0;
-        if (!strcasecmp(str, "yes")) res = 1;
+        if      (!strcasecmp(str, "off")) res = 0;
+        else if (!strcasecmp(str, "yes")) res = 1;
+        else if (!strcasecmp(str, "yep")) res = 1;
         break;
     case 4:
-        if (!strcasecmp(str, "true")) res = 1;
-        if (!strcasecmp(str, "sure")) res = 1;
-        if (!strcasecmp(str, "nope")) res = 0;
+        if      (!strcasecmp(str, "true")) res = 1;
+        else if (!strcasecmp(str, "sure")) res = 1;
+        else if (!strcasecmp(str, "none")) res = 0;
+        else if (!strcasecmp(str, "nope")) res = 0;
+        else if (!strcasecmp(str, "yeah")) res = 1;
         break;
     case 5:
         if (!strcasecmp(str, "false")) res = 0;

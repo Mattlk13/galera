@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2015 Codership Oy <info@codership.com>
+ * Copyright (C) 2009-2020 Codership Oy <info@codership.com>
  */
 
 #include "GCache.hpp"
@@ -8,41 +8,90 @@
 
 namespace gcache
 {
-    bool
-    GCache::discard_seqno (int64_t seqno)
+    void
+    GCache::discard_buffer (BufferHeader* bh)
     {
-        for (seqno2ptr_t::iterator i = seqno2ptr.begin();
-             i != seqno2ptr.end() && i->first <= seqno;)
+        bh->seqno_g = SEQNO_ILL; // will never be reused
+        switch (bh->store)
         {
-            BufferHeader* bh(ptr2BH (i->second));
+        case BUFFER_IN_MEM:  mem.discard (bh); break;
+        case BUFFER_IN_RB:   rb.discard  (bh); break;
+        case BUFFER_IN_PAGE: ps.discard  (bh); break;
+        default:
+            log_fatal << "Corrupt buffer header: " << bh;
+            abort();
+        }
+    }
+
+    bool
+    GCache::discard_seqno (seqno_t seqno)
+    {
+#ifndef NDEBUG
+        seqno_t const begin(params.debug() ?
+                            (seqno2ptr.empty() ?
+                             seqno2ptr.index_begin() : SEQNO_NONE) : SEQNO_NONE);
+        if (params.debug())
+        {
+            assert(begin > 0);
+            log_info << "GCache::discard_seqno(" << begin << " - "
+                     << seqno << ")";
+        }
+#endif
+        /* if we can't complete the operation, let's not even start */
+        if (seqno >= seqno_locked)
+        {
+#ifndef NDEBUG
+            if (params.debug())
+            {
+                log_info << "GCache::discard_seqno(" << begin << " - " << seqno
+                         << "): " << seqno_locked << " is locked, bailing out.";
+            }
+#endif
+            return false;
+        }
+
+        while (seqno2ptr.index_begin() <= seqno && !seqno2ptr.empty())
+        {
+            BufferHeader* const bh(ptr2BH(seqno2ptr.front()));
 
             if (gu_likely(BH_is_released(bh)))
             {
-                assert (bh->seqno_g == i->first);
+                assert (bh->seqno_g == seqno2ptr.index_begin());
                 assert (bh->seqno_g <= seqno);
-                assert (bh->seqno_g <= seqno_released);
-
-                seqno2ptr.erase (i++); // post ++ is significant!
-
-                bh->seqno_g = SEQNO_ILL; // will never be reused
-
-                switch (bh->store)
-                {
-                case BUFFER_IN_MEM:  mem.discard (bh); break;
-                case BUFFER_IN_RB:   rb.discard  (bh); break;
-                case BUFFER_IN_PAGE: ps.discard  (bh); break;
-                default:
-                    log_fatal << "Corrupt buffer header: " << bh;
-                    abort();
-                }
+                discard_buffer(bh);
             }
             else
             {
+#ifndef NDEBUG
+                if (params.debug())
+                {
+                    log_info << "GCache::discard_seqno(" << begin << " - "
+                             << seqno << "): "
+                             << bh->seqno_g << " not released, bailing out.";
+                }
+#endif
                 return false;
             }
+
+            seqno2ptr.pop_front();
         }
 
         return true;
+    }
+
+    void
+    GCache::discard_tail (seqno_t const seqno)
+    {
+        while (seqno2ptr.index_back() > seqno && !seqno2ptr.empty())
+        {
+            BufferHeader* bh(ptr2BH(seqno2ptr.back()));
+
+            assert(BH_is_released(bh));
+            assert(bh->seqno_g == seqno2ptr.index_back());
+
+            discard_buffer(bh);
+            seqno2ptr.pop_back();
+        }
     }
 
     void*
@@ -54,7 +103,7 @@ namespace gcache
 
         if (gu_likely(s > 0))
         {
-            size_type const size(s + sizeof(BufferHeader));
+            size_type const size(MemOps::align_size(s + sizeof(BufferHeader)));
 
             gu::Lock lock(mtx);
 
@@ -71,6 +120,8 @@ namespace gcache
 #endif
         }
 
+        assert((uintptr_t(ptr) % MemOps::ALIGNMENT) == 0);
+
         return ptr;
     }
 
@@ -79,6 +130,8 @@ namespace gcache
     {
         assert(bh->seqno_g != SEQNO_ILL);
         BH_release(bh);
+
+        seqno_t new_released(seqno_released);
 
         if (gu_likely(SEQNO_NONE != bh->seqno_g))
         {
@@ -92,7 +145,7 @@ namespace gcache
             assert(seqno_released + 1 == bh->seqno_g ||
                    SEQNO_NONE == seqno_released);
 #endif
-            seqno_released = bh->seqno_g;
+            new_released = bh->seqno_g;
         }
 #ifndef NDEBUG
         void* const ptr(bh + 1);
@@ -113,7 +166,11 @@ namespace gcache
         case BUFFER_IN_PAGE:
             if (gu_likely(bh->seqno_g > 0))
             {
-                discard_seqno (bh->seqno_g);
+                if (gu_unlikely(!discard_seqno(bh->seqno_g)))
+                {
+                    new_released = (bh->seqno_g - 1);
+                    assert(seqno_released <= new_released);
+                }
             }
             else
             {
@@ -124,6 +181,15 @@ namespace gcache
             break;
         }
         rb.assert_size_free();
+
+#ifndef NDEBUG
+        if (params.debug())
+        {
+            log_info << "GCache::free_common(): seqno_released: "
+                     << seqno_released << " -> " << new_released;
+        }
+#endif
+        seqno_released = new_released;
     }
 
     void
@@ -134,6 +200,9 @@ namespace gcache
             BufferHeader* const bh(ptr2BH(ptr));
             gu::Lock      lock(mtx);
 
+#ifndef NDEBUG
+            if (params.debug()) { log_info << "GCache::free() " << bh; }
+#endif
             free_common (bh);
         }
         else {
@@ -157,7 +226,9 @@ namespace gcache
             return NULL;
         }
 
-        size_type const size(s + sizeof(BufferHeader));
+        assert((uintptr_t(ptr) % MemOps::ALIGNMENT) == 0);
+
+        size_type const size(MemOps::align_size(s + sizeof(BufferHeader)));
 
         void*               new_ptr(NULL);
         BufferHeader* const bh(ptr2BH(ptr));
@@ -210,6 +281,7 @@ namespace gcache
 
         }
 #endif
+        assert((uintptr_t(new_ptr) % MemOps::ALIGNMENT) == 0);
 
         return new_ptr;
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2014 Codership Oy <info@codership.com>
+ * Copyright (C) 2008-2020 Codership Oy <info@codership.com>
  *
  * $Id$
  */
@@ -137,23 +137,58 @@ struct gcs_conn
     /* Flow Control */
     gu_mutex_t   fc_lock;
     uint32_t     conf_id;             // configuration ID
-    long         stop_sent;           // how many STOPs - CONTs were sent
+    int          stop_sent_;          // how many STOPs - CONTs were sent
+    int          stop_sent()
+    {
+#ifdef GU_DEBUG_MUTEX
+        assert(gu_mutex_owned(&fc_lock));
+#endif
+        return stop_sent_;
+    }
+    void         stop_sent_inc(int val)
+    {
+#ifdef GU_DEBUG_MUTEX
+        assert(gu_mutex_owned(&fc_lock));
+#endif
+        stop_sent_ += val;
+        assert(stop_sent_ > 0);
+    }
+    void         stop_sent_dec(int val)
+    {
+#ifdef GU_DEBUG_MUTEX
+        assert(gu_mutex_owned(&fc_lock));
+#endif
+        assert(stop_sent_ >= val);
+        assert(stop_sent_ > 0);
+        stop_sent_ -= val;
+    }
     long         stop_count;          // counts stop requests received
     long         queue_len;           // slave queue length
     long         upper_limit;         // upper slave queue limit
     long         lower_limit;         // lower slave queue limit
     long         fc_offset;           // offset for catchup phase
     gcs_conn_state_t max_fc_state;    // maximum state when FC is enabled
-    long         stats_fc_sent;       // FC stats counters
+    long         stats_fc_stop_sent;  // FC stats counters
+    long         stats_fc_cont_sent;  //
     long         stats_fc_received;   //
     gcs_fc_t     stfc; // state transfer FC object
 
     /* #603, #606 join control */
-    bool        volatile need_to_join;
     gcs_seqno_t volatile join_seqno;
+    bool        volatile need_to_join;
 
     /* sync control */
-    bool         sync_sent;
+    bool         sync_sent_;
+    bool         sync_sent() const
+    {
+        assert(gu_fifo_locked(recv_q));
+        return sync_sent_;
+    }
+    void         sync_sent(bool const val)
+    {
+        assert(gu_fifo_locked(recv_q));
+        sync_sent_ = val;
+    }
 
     /* gcs_core object */
     gcs_core_t*  core; // the context that is returned by
@@ -267,9 +302,17 @@ gcs_create (gu_config_t* const conf, gcache_t* const gcache,
 
     {
         size_t recv_q_len = gu_avphys_bytes() / sizeof(struct gcs_recv_act) / 4;
-
-        gu_debug ("Requesting recv queue len: %zu", recv_q_len);
-        conn->recv_q = gu_fifo_create (recv_q_len, sizeof(struct gcs_recv_act));
+        if (recv_q_len == 0)
+        {
+            gu_error ("Requesting recv queue len: %zu", recv_q_len);
+            gu_error ("Available system memory is running low: %zu",
+                      gu_avphys_bytes());
+        }
+        else
+        {
+            gu_debug ("Requesting recv queue len: %zu", recv_q_len);
+            conn->recv_q = gu_fifo_create (recv_q_len, sizeof(struct gcs_recv_act));
+        }
     }
     if (!conn->recv_q) {
         gu_error ("Failed to create recv_q.");
@@ -347,8 +390,8 @@ gcs_init (gcs_conn_t* conn, gcs_seqno_t seqno, const uint8_t uuid[GU_UUID_LEN])
  * @param warning warning to log if necessary
  * @return        0 if error can be ignored, original err value if not
  */
-static long
-gcs_check_error (long err, const char* warning)
+static int
+gcs_check_error (int err, const char* warning)
 {
     switch (err)
     {
@@ -379,7 +422,7 @@ gcs_fc_stop_begin (gcs_conn_t* conn)
     long err = 0;
 
     bool ret = (conn->stop_count <= 0                                     &&
-                conn->stop_sent  <= 0                                     &&
+                conn->stop_sent_ <= 0                                     &&
                 conn->queue_len  >  (conn->upper_limit + conn->fc_offset) &&
                 conn->state      <= conn->max_fc_state                    &&
                 !(err = gu_mutex_lock (&conn->fc_lock)));
@@ -389,29 +432,43 @@ gcs_fc_stop_begin (gcs_conn_t* conn)
             abort();
     }
 
-    conn->stop_sent += ret;
-
     return ret;
 }
 
 /* Complement to gcs_fc_stop_begin. */
-static inline long
+static inline int
 gcs_fc_stop_end (gcs_conn_t* conn)
 {
-    long ret;
+#ifdef GU_DEBUG_MUTEX
+    assert(gu_mutex_owned(&conn->fc_lock));
+#endif
 
-    gu_debug ("SENDING FC_STOP (local seqno: %lld, fc_offset: %ld)",
-              conn->local_act_id, conn->fc_offset);
+    int ret = 0;
 
-    ret = gcs_send_fc_event (conn, GCS_FC_STOP);
+    if (conn->stop_sent() <= 0)
+    {
+        conn->stop_sent_inc(1);
+        gu_mutex_unlock (&conn->fc_lock);
 
-    if (ret >= 0) {
-        ret = 0;
-        conn->stats_fc_sent++;
+        ret = gcs_send_fc_event (conn, GCS_FC_STOP);
+
+        gu_mutex_lock (&conn->fc_lock);
+        if (ret >= 0) {
+            ret = 0;
+            conn->stats_fc_stop_sent++;
+        }
+        else {
+            assert (conn->stop_sent() > 0);
+            /* restore counter */
+            conn->stop_sent_dec(1);
+        }
+
+        gu_debug ("SENDING FC_STOP (local seqno: %lld, fc_offset: %ld): %d",
+                 conn->local_act_id, conn->fc_offset, ret);
     }
-    else {
-        conn->stop_sent--;
-        assert (conn->stop_sent >= 0);
+    else
+    {
+        gu_debug ("SKIPPED FC_STOP sending: stop_sent = %d", conn->stop_sent());
     }
 
     gu_mutex_unlock (&conn->fc_lock);
@@ -430,7 +487,7 @@ gcs_fc_cont_begin (gcs_conn_t* conn)
     bool queue_decreased = (conn->fc_offset > conn->queue_len &&
                             (conn->fc_offset = conn->queue_len, true));
 
-    bool ret = (conn->stop_sent    >  0                                   &&
+    bool ret = (conn->stop_sent_  >  0                                    &&
                 (conn->lower_limit >= conn->queue_len || queue_decreased) &&
                 conn->state        <= conn->max_fc_state                  &&
                 !(err = gu_mutex_lock (&conn->fc_lock)));
@@ -440,27 +497,41 @@ gcs_fc_cont_begin (gcs_conn_t* conn)
         abort();
     }
 
-    conn->stop_sent -= ret; // decrement optimistically to allow for parallel
-                            // recv threads
     return ret;
 }
 
 /* Complement to gcs_fc_cont_begin() */
-static inline long
+static inline int
 gcs_fc_cont_end (gcs_conn_t* conn)
 {
-    long ret;
+    int ret = 0;
 
-    assert (GCS_CONN_DONOR >= conn->state);
+    assert (GCS_CONN_JOINER >= conn->state);
 
-    gu_debug ("SENDING FC_CONT (local seqno: %lld, fc_offset: %ld)",
-              conn->local_act_id, conn->fc_offset);
+    if (conn->stop_sent())
+    {
+        conn->stop_sent_dec(1);
+        gu_mutex_unlock (&conn->fc_lock);
 
-    ret = gcs_send_fc_event (conn, GCS_FC_CONT);
+        ret = gcs_send_fc_event (conn, GCS_FC_CONT);
 
-    if (gu_likely (ret >= 0)) { ret = 0; }
+        gu_mutex_lock (&conn->fc_lock);
+        if (gu_likely (ret >= 0)) {
+            ret = 0;
+            conn->stats_fc_cont_sent++;
+        }
+        else {
+            /* restore counter */
+            conn->stop_sent_inc(1);
+        }
 
-    conn->stop_sent += (ret != 0); // fix count in case of error
+        gu_debug ("SENDING FC_CONT (local seqno: %lld, fc_offset: %ld): %d",
+                 conn->local_act_id, conn->fc_offset, ret);
+    }
+    else
+    {
+        gu_debug ("SKIPPED FC_CONT sending: stop_sent = %d", conn->stop_sent());
+    }
 
     gu_mutex_unlock (&conn->fc_lock);
 
@@ -474,9 +545,15 @@ static inline bool
 gcs_send_sync_begin (gcs_conn_t* conn)
 {
     if (gu_unlikely(GCS_CONN_JOINED == conn->state)) {
-        if (conn->lower_limit >= conn->queue_len && !conn->sync_sent) {
+        if (conn->lower_limit >= conn->queue_len && !conn->sync_sent()) {
             // tripped lower slave queue limit, send SYNC message
-            conn->sync_sent = true;
+            conn->sync_sent(true);
+#if 0
+            gu_info ("Sending SYNC: state = %s, queue_len = %ld, "
+                     "lower_limit = %ld, sync_sent = %s",
+                     gcs_conn_state_str[conn->state], conn->queue_len,
+                     conn->lower_limit, conn->sync_sent() ? "true" : "false");
+#endif
             return true;
         }
 #if 0
@@ -484,7 +561,7 @@ gcs_send_sync_begin (gcs_conn_t* conn)
             gu_info ("Not sending SYNC: state = %s, queue_len = %ld, "
                      "lower_limit = %ld, sync_sent = %s",
                      gcs_conn_state_str[conn->state], conn->queue_len,
-                     conn->lower_limit, conn->sync_sent ? "true" : "false");
+                     conn->lower_limit, conn->sync_sent() ? "true" : "false");
         }
 #endif
     }
@@ -505,7 +582,9 @@ gcs_send_sync_end (gcs_conn_t* conn)
         ret = 0;
     }
     else {
-        conn->sync_sent = false;
+        gu_fifo_lock(conn->recv_q);
+        conn->sync_sent(false);
+        gu_fifo_release(conn->recv_q);
     }
 
     ret = gcs_check_error (ret, "Failed to send SYNC signal");
@@ -516,7 +595,11 @@ gcs_send_sync_end (gcs_conn_t* conn)
 static inline long
 gcs_send_sync (gcs_conn_t* conn)
 {
-    if (gcs_send_sync_begin (conn)) {
+    gu_fifo_lock(conn->recv_q);
+    bool const send_sync(gcs_send_sync_begin (conn));
+    gu_fifo_release(conn->recv_q);
+
+    if (send_sync) {
         return gcs_send_sync_end (conn);
     }
     else {
@@ -587,19 +670,18 @@ gcs_set_pkt_size (gcs_conn_t *conn, long pkt_size)
     return ret;
 }
 
-static long
+static int
 _release_flow_control (gcs_conn_t* conn)
 {
     int err = 0;
 
     if (gu_unlikely(err = gu_mutex_lock (&conn->fc_lock))) {
-        gu_fatal ("Mutex lock failed: %d (%s)", err, strerror(err));
+        gu_fatal ("FC mutex lock failed: %d (%s)", err, strerror(err));
         abort();
     }
 
-    if (conn->stop_sent) {
-        assert (1 == conn->stop_sent);
-        conn->stop_sent--;
+    if (conn->stop_sent()) {
+        assert (1 == conn->stop_sent());
         err = gcs_fc_cont_end (conn);
     }
     else {
@@ -612,13 +694,20 @@ _release_flow_control (gcs_conn_t* conn)
 static void
 gcs_become_primary (gcs_conn_t* conn)
 {
+    assert(conn->join_seqno == GCS_SEQNO_ILL ||
+           conn->state == GCS_CONN_JOINER    ||
+           conn->state == GCS_CONN_OPEN /* joiner that has received NON_PRIM */);
+
     if (!gcs_shift_state (conn, GCS_CONN_PRIMARY)) {
         gu_fatal ("Protocol violation, can't continue");
         gcs_close (conn);
         abort();
     }
 
-    long ret;
+    conn->join_seqno   = GCS_SEQNO_NIL;
+    conn->need_to_join = false;
+
+    int ret;
 
     if ((ret = _release_flow_control (conn))) {
         gu_fatal ("Failed to release flow control: %ld (%s)",
@@ -683,20 +772,22 @@ gcs_become_donor (gcs_conn_t* conn)
     return 0; // do not pass to application
 }
 
-static long
+static int
 _release_sst_flow_control (gcs_conn_t* conn)
 {
-    long ret = 0;
+    int ret = 0;
 
     do {
-        if (conn->stop_sent > 0) {
-            ret = gcs_send_fc_event (conn, GCS_FC_CONT);
-            conn->stop_sent -= (ret >= 0);
+        ret = gu_mutex_lock(&conn->fc_lock);
+        if (!ret) {
+            ret = gcs_fc_cont_end(conn);
+        }
+        else {
+            gu_fatal("failed to lock FC mutex");
+            abort();
         }
     }
-    while (ret < 0 && -EAGAIN == ret); // we need to send CONT here at all costs
-
-    ret = gcs_check_error (ret, "Failed to release SST flow control.");
+    while (-EAGAIN == ret); // we need to send CONT here at all costs
 
     return ret;
 }
@@ -704,7 +795,7 @@ _release_sst_flow_control (gcs_conn_t* conn)
 static void
 gcs_become_joined (gcs_conn_t* conn)
 {
-    long ret;
+    int ret;
 
     if (GCS_CONN_JOINER == conn->state) {
         ret = _release_sst_flow_control (conn);
@@ -719,6 +810,7 @@ gcs_become_joined (gcs_conn_t* conn)
     /* See also gcs_handle_act_conf () for a case of cluster bootstrapping */
     if (gcs_shift_state (conn, GCS_CONN_JOINED)) {
         conn->fc_offset    = conn->queue_len;
+        conn->join_seqno   = GCS_SEQNO_NIL;
         conn->need_to_join = false;
         gu_debug("Become joined, FC offset %ld", conn->fc_offset);
         /* One of the cases when the node can become SYNCED */
@@ -734,8 +826,12 @@ gcs_become_joined (gcs_conn_t* conn)
 static void
 gcs_become_synced (gcs_conn_t* conn)
 {
-    gcs_shift_state (conn, GCS_CONN_SYNCED);
-    conn->sync_sent = false;
+    gu_fifo_lock(conn->recv_q);
+    {
+        gcs_shift_state (conn, GCS_CONN_SYNCED);
+        conn->sync_sent(false);
+    }
+    gu_fifo_release(conn->recv_q);
     gu_debug("Become synced, FC offset %ld", conn->fc_offset);
     conn->fc_offset = 0;
 }
@@ -798,12 +894,12 @@ _reset_pkt_size(gcs_conn_t* conn)
     }
 }
 
-static long
-_join (gcs_conn_t* conn, gcs_seqno_t seqno)
+static int
+s_join (gcs_conn_t* conn)
 {
-    long err;
+    int err;
 
-    while (-EAGAIN == (err = gcs_core_send_join (conn->core, seqno)))
+    while (-EAGAIN == (err = gcs_core_send_join (conn->core, conn->join_seqno)))
         usleep (10000);
 
     switch (err)
@@ -811,6 +907,7 @@ _join (gcs_conn_t* conn, gcs_seqno_t seqno)
     case -ENOTCONN:
         gu_warn ("Sending JOIN failed: %d (%s). "
                  "Will retry in new primary component.", err, strerror(-err));
+        // fall through
     case 0:
         return 0;
     default:
@@ -834,7 +931,10 @@ gcs_handle_act_conf (gcs_conn_t* conn, const void* action)
     {
         /* reset flow control as membership is most likely changed */
         if (!gu_mutex_lock (&conn->fc_lock)) {
-            conn->stop_sent   = 0;
+            /* wake up send monitor if it was paused */
+            if (conn->stop_count > 0) gcs_sm_continue(conn->sm);
+
+            conn->stop_sent_  = 0;
             conn->stop_count  = 0;
             conn->conf_id     = conf->conf_id;
             conn->memb_num    = conf->memb_num;
@@ -848,10 +948,7 @@ gcs_handle_act_conf (gcs_conn_t* conn, const void* action)
             abort();
         }
 
-        conn->sync_sent = false;
-
-        // need to wake up send monitor if it was paused during CC
-        gcs_sm_continue(conn->sm);
+        conn->sync_sent(false);
     }
     gu_fifo_release (conn->recv_q);
 
@@ -922,26 +1019,16 @@ gcs_handle_act_conf (gcs_conn_t* conn, const void* action)
     switch (conn->state) {
     case GCS_CONN_JOINED:
         /* One of the cases when the node can become SYNCED */
-    {
-        bool send_sync = false;
-
-        gu_fifo_lock(conn->recv_q);
-        {
-            send_sync = gcs_send_sync_begin(conn);
-        }
-        gu_fifo_release (conn->recv_q);
-
-        if (send_sync && (ret = gcs_send_sync_end (conn))) {
+        if ((ret = gcs_send_sync(conn)) < 0) {
             gu_warn ("CC: sending SYNC failed: %ld (%s)", ret, strerror (-ret));
         }
-    }
     break;
     case GCS_CONN_JOINER:
     case GCS_CONN_DONOR:
         /* #603, #606 - duplicate JOIN msg in case we lost it */
         assert (conf->conf_id >= 0);
 
-        if (conn->need_to_join) _join (conn, conn->join_seqno);
+        if (conn->need_to_join) s_join (conn);
 
         break;
     default:
@@ -981,8 +1068,9 @@ gcs_handle_state_change (gcs_conn_t*     conn,
 
     if (buf) {
         memcpy (buf, act->buf, act->buf_len);
-        /* initially act->buf points to internal static recv buffer. No leak here */
-        act->buf = buf;
+        /* Initially act->buf points to internal static recv buffer.
+         * No leak here. */
+        ((struct gcs_act*)act)->buf = buf;
         return 1;
     }
     else {
@@ -1025,8 +1113,15 @@ gcs_handle_actions (gcs_conn_t*          conn,
             gcs_become_joined (conn);
         break;
     case GCS_ACT_SYNC:
-        ret = gcs_handle_state_change (conn, &rcvd->act);
-        gcs_become_synced (conn);
+        if (rcvd->id < 0) {
+            gu_fifo_lock(conn->recv_q);
+            conn->sync_sent(false);
+            gu_fifo_release(conn->recv_q);
+            gcs_send_sync(conn);
+        } else {
+            ret = gcs_handle_state_change (conn, &rcvd->act);
+            gcs_become_synced (conn);
+        }
         break;
     default:
         break;
@@ -1076,14 +1171,13 @@ _check_recv_queue_growth (gcs_conn_t* conn, ssize_t size)
 
     if (pause > 0) {
         /* replication needs throttling */
-        if (conn->stop_sent <= 0) {
-            if ((ret = gcs_send_fc_event (conn, GCS_FC_STOP)) >= 0) {
-                conn->stop_sent++;
-                ret = 0;
-            }
-            else {
-                ret = gcs_check_error (ret, "Failed to send SST FC_STOP.");
-            }
+        ret = gu_mutex_lock(&conn->fc_lock);
+        if (!ret) {
+            ret = gcs_fc_stop_end(conn);
+        }
+        else {
+            gu_fatal("failed to lock FC mutex");
+            abort();
         }
 
         if (gu_likely(pause != GU_TIME_ETERNITY)) {
@@ -1194,28 +1288,35 @@ static void *gcs_recv_thread (void *arg)
         struct gcs_repl_act** repl_act_ptr;
         struct gcs_act_rcvd   rcvd;
 
-        bool* sync_sent = (conn->state == GCS_CONN_DONOR
-                           ? &conn->sync_sent : NULL);
-        ret = gcs_core_recv (conn->core, &rcvd, conn->timeout, sync_sent);
+        ret = gcs_core_recv (conn->core, &rcvd, conn->timeout);
 
         if (gu_unlikely(ret <= 0)) {
 
-            if (-ETIMEDOUT == ret && _handle_timeout(conn)) continue;
+            gu_debug ("gcs_core_recv returned %d: %s", ret, strerror(-ret));
 
-            struct gcs_recv_act* err_act =
-                (struct gcs_recv_act*) gu_fifo_get_tail(conn->recv_q);
+            if (-ETIMEDOUT == ret && _handle_timeout(conn)) continue;
 
             assert (NULL          == rcvd.act.buf);
             assert (0             == rcvd.act.buf_len);
-            assert (GCS_ACT_ERROR == rcvd.act.type);
+            assert (GCS_ACT_ERROR == rcvd.act.type ||
+                    GCS_ACT_INCONSISTENCY == rcvd.act.type);
             assert (GCS_SEQNO_ILL == rcvd.id);
+
+            if (GCS_ACT_INCONSISTENCY == rcvd.act.type) {
+                /* In the case of inconsistency our concern is to report it to
+                 * replicator ASAP. Current contents of the slave queue are
+                 * meaningless. */
+                gu_fifo_clear(conn->recv_q);
+            }
+
+            struct gcs_recv_act* err_act =
+                (struct gcs_recv_act*) gu_fifo_get_tail(conn->recv_q);
 
             err_act->rcvd     = rcvd;
             err_act->local_id = GCS_SEQNO_ILL;
 
             GCS_FIFO_PUSH_TAIL (conn, rcvd.act.buf_len);
 
-            gu_debug ("gcs_core_recv returned %d: %s", ret, strerror(-ret));
             break;
         }
 
@@ -1281,12 +1382,12 @@ static void *gcs_recv_thread (void *arg)
                 recv_act->local_id = this_act_id;
 
                 conn->queue_len = gu_fifo_length (conn->recv_q) + 1;
-                bool send_stop  = gcs_fc_stop_begin (conn);
+                bool const send_stop(gcs_fc_stop_begin(conn));
 
                 // release queue
                 GCS_FIFO_PUSH_TAIL (conn, rcvd.act.buf_len);
 
-                if (gu_unlikely(GCS_CONN_JOINER == conn->state)) {
+                if (gu_unlikely(GCS_CONN_JOINER == conn->state && !send_stop)) {
                     ret = _check_recv_queue_growth (conn, rcvd.act.buf_len);
                     assert (ret <= 0);
                     if (ret < 0) break;
@@ -1444,7 +1545,7 @@ long gcs_destroy (gcs_conn_t *conn)
     gu_cond_t tmp_cond;
     gu_cond_init (&tmp_cond, NULL);
 
-    if ((err = gcs_sm_enter (conn->sm, &tmp_cond, false, true))) // need an error here
+    if (!(err = gcs_sm_enter (conn->sm, &tmp_cond, false, true))) // need an error here
     {
         if (GCS_CONN_CLOSED != conn->state)
         {
@@ -1457,8 +1558,7 @@ long gcs_destroy (gcs_conn_t *conn)
             return -EBADFD;
         }
 
-        /* this should cancel all recv calls */
-        gu_fifo_destroy (conn->recv_q);
+        gcs_sm_leave (conn->sm);
 
         gcs_shift_state (conn, GCS_CONN_DESTROYED);
 //DELETE        conn->err   = -EBADFD;
@@ -1466,11 +1566,11 @@ long gcs_destroy (gcs_conn_t *conn)
          * to acquire the lock and give up gracefully */
     }
     else {
-        gcs_sm_leave (conn->sm);
-        gu_cond_destroy (&tmp_cond);
-        err = -EBADFD;
-        return err;
+        gu_debug("gcs_destroy: gcs_sm_enter() err = %d", err);
+        // We should still cleanup resources
     }
+
+    gu_fifo_destroy (conn->recv_q);
 
     gu_cond_destroy (&tmp_cond);
     gcs_sm_destroy (conn->sm);
@@ -1534,9 +1634,9 @@ long gcs_interrupt (gcs_conn_t* conn, long handle)
     return gcs_sm_interrupt (conn->sm, handle);
 }
 
-gcs_seqno_t gcs_caused(gcs_conn_t* conn)
+long gcs_caused(gcs_conn_t* conn, gcs_seqno_t& seqno)
 {
-    return gcs_core_caused(conn->core);
+    return gcs_core_caused(conn->core, seqno);
 }
 
 /* Puts action in the send queue and returns after it is replicated */
@@ -1933,7 +2033,7 @@ gcs_set_last_applied (gcs_conn_t* conn, gcs_seqno_t seqno)
 }
 
 long
-gcs_join (gcs_conn_t* conn, gcs_seqno_t seqno)
+gcs_join (gcs_conn_t* conn, gcs_seqno_t const seqno)
 {
     // Even when node is evicted from the cluster in middle of SST,
     // the SST may completes normally. After this, the node calls
@@ -1946,17 +2046,20 @@ gcs_join (gcs_conn_t* conn, gcs_seqno_t seqno)
     // To do this, we should check the current connection state
     // in the gcs_join() function to return from it immediately
     // if the node's communication channel was closed:
+    if (conn->state >= GCS_CONN_CLOSED) {
+        return GCS_CLOSED_ERROR;
+    }
 
-    if (conn->state < GCS_CONN_CLOSED)
+    assert(conn->join_seqno <= seqno || seqno < 0);
+
+    if (seqno < 0 || seqno >= conn->join_seqno)
     {
         conn->join_seqno   = seqno;
         conn->need_to_join = true;
-        return _join (conn, seqno);
+        return s_join (conn);
     }
-    else
-    {
-        return GCS_CLOSED_ERROR;
-    }
+
+    return 0;
 }
 
 gcs_seqno_t gcs_local_sequence(gcs_conn_t* conn)
@@ -1983,8 +2086,11 @@ gcs_get_stats (gcs_conn_t* conn, struct gcs_stats* stats)
                       &stats->fc_paused_ns,
                       &stats->fc_paused_avg);
 
-    stats->fc_sent     = conn->stats_fc_sent;
+    stats->fc_ssent    = conn->stats_fc_stop_sent;
+    stats->fc_csent    = conn->stats_fc_cont_sent;
     stats->fc_received = conn->stats_fc_received;
+    stats->fc_active   = conn->stop_count > 0;
+    stats->fc_requested= conn->stop_sent_ > 0;
 }
 
 void
@@ -1992,8 +2098,9 @@ gcs_flush_stats(gcs_conn_t* conn)
 {
     gu_fifo_stats_flush(conn->recv_q);
     gcs_sm_stats_flush (conn->sm);
-    conn->stats_fc_sent     = 0;
-    conn->stats_fc_received = 0;
+    conn->stats_fc_stop_sent = 0;
+    conn->stats_fc_cont_sent = 0;
+    conn->stats_fc_received  = 0;
 }
 
 void gcs_get_status(gcs_conn_t* conn, gu::Status& status)
@@ -2234,6 +2341,12 @@ long gcs_param_set  (gcs_conn_t* conn, const char* key, const char *value)
     else if (!strcmp (key, GCS_PARAMS_MAX_THROTTLE)) {
         return _set_max_throttle (conn, value);
     }
+#ifdef GCS_SM_DEBUG
+    else if (!strcmp (key, GCS_PARAMS_SM_DUMP)) {
+        gcs_sm_dump_state(conn->sm, stderr);
+        return 0;
+    }
+#endif /* GCS_SM_DEBUG */
     else {
         return gcs_core_param_set (conn->core, key, value);
     }
@@ -2244,4 +2357,10 @@ const char* gcs_param_get (gcs_conn_t* conn, const char* key)
     gu_warn ("Not implemented: %s", __FUNCTION__);
 
     return NULL;
+}
+
+
+void gcs_join_notification(gcs_conn_t* conn)
+{
+     conn->need_to_join = true;
 }

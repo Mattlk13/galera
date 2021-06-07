@@ -6,8 +6,12 @@ untar_cmd()
 {
     local node=${@:$#}
     local path="${NODE_TEST_DIR[$node]}"
+    local data=$path/mysql/var
     local hst=$(hostname -s)
-    echo -n "mkdir -p \"$path\" && tar --strip 1 -C \"$path\" -xzf - && > \"$path/mysql/var/mysqld.err\" && exit 0"
+    local SAVE="([ -d \"$data\" ] && rm -rf \"$data\".saved && mv \"$data\" \"$data\".saved || :) && "
+    local UNTAR="mkdir -p \"$path\" && tar --strip 1 -C \"$path\" -xzf - && > \"$path/mysql/var/mysqld.err\" && "
+    local RESTORE="([ -d \"$data\".saved ] && rm -rf \"$data\" && mv \"$data\".saved \"$data\" || :) "
+    echo -n "$SAVE $UNTAR $RESTORE"
 }
 
 copy_config()
@@ -15,6 +19,8 @@ copy_config()
     local -r node=$1
     local cnf
     local cnf_dir
+    local ca_src="$BASE_CONF/galera_ca.pem"
+    local ca_dst
     local key_src="$BASE_CONF/galera_key.pem"
     local key_dst
     local cert_src="$BASE_CONF/galera_cert.pem"
@@ -25,6 +31,7 @@ copy_config()
         common_cnf="$COMMON_MY_CNF"
         cnf_src="${NODE_MY_CNF[$node]}"
         cnf_dst="${NODE_TEST_DIR[$node]}/mysql/etc/my.cnf"
+        ca_dst="${NODE_TEST_DIR[$node]}/mysql/var/galera_ca.pem"
         key_dst="${NODE_TEST_DIR[$node]}/mysql/var/galera_key.pem"
         cert_dst="${NODE_TEST_DIR[$node]}/mysql/var/galera_cert.pem"
         ;;
@@ -41,6 +48,7 @@ copy_config()
             ([ -n "$common_cnf" ] && cat "$common_cnf" && \
              [ -n "$cnf_src" ]    && cat "$cnf_src") > "$cnf_dst"
 
+            cat "$ca_src"  >  "$ca_dst"
             cat "$key_src"  > "$key_dst"
             cat "$cert_src" > "$cert_dst"
         else
@@ -49,6 +57,7 @@ copy_config()
              [ -n "$cnf_src" ]    && cat "$cnf_src")    | \
             ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no "$remote" "cat > $cnf_dst"
 
+            cat "$ca_src"   | ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no "$remote" "cat > $ca_dst"
             cat "$key_src"  | ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no "$remote" "cat > $key_dst"
             cat "$cert_src" | ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no "$remote" "cat > $cert_dst"
         fi

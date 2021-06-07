@@ -1,6 +1,6 @@
 ###################################################################
 #
-# Copyright (C) 2010-2015 Codership Oy <info@codership.com>
+# Copyright (C) 2010-2020 Codership Oy <info@codership.com>
 #
 # SCons build script to build galera libraries
 #
@@ -13,6 +13,12 @@
 # Set CXXFLAGS to supply C++ compiler options
 # Set LDFLAGS  to *override* linking flags
 # Set LIBPATH  to add non-standard linker paths
+# Set RPATH    to add rpaths
+#
+# Some useful CPPFLAGS:
+# GCS_SM_DEBUG          - enable dumping of send monitor state and history
+# GU_DEBUG_MUTEX        - enable mutex debug instrumentation
+# GU_DBUG_ON            - enable sync point macros
 #
 # Script structure:
 # - Help message
@@ -27,13 +33,24 @@
 import os
 import platform
 import string
+import subprocess
+from sys import version_info
+python_ver = version_info[0]
+
+# Execute a command and read the first line of its stdout.
+# For example read_first_line(["ls", "-l", "/usr"])
+def read_first_line(cmd):
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    stdout = p.communicate()[0]
+    line = stdout.splitlines()[0]
+    return line
 
 sysname = os.uname()[0].lower()
 machine = platform.machine()
 bits = ARGUMENTS.get('bits', platform.architecture()[0])
-print 'Host: ' + sysname + ' ' + machine + ' ' + bits
+print('Host: ' + sysname + ' ' + machine + ' ' + bits)
 
-x86 = any(arch in machine for arch in [ 'x86', 'amd64', 'i686', 'i386' ])
+x86 = any(arch in machine for arch in [ 'x86', 'amd64', 'i686', 'i386', 'i86pc' ])
 
 if bits == '32bit':
     bits = 32
@@ -49,16 +66,20 @@ Build targets:  build tests check install all
 Default target: all
 
 Commandline Options:
-    static_ssl=[0|1]    Build with static SSL
-    with_ssl=path       Prefix for SSL
     debug=n             debug build with optimization level n
+    asan=[0|1]          disable or enable ASAN instrumentation
     build_dir=dir       build directory, default: '.'
     boost=[0|1]         disable or enable boost libraries
+    system_asio=[0|1]   use system asio library, if available
     boost_pool=[0|1]    use or not use boost pool allocator
     revno=XXXX          source code revision number
     bpostatic=path      a path to static libboost_program_options.a
+    static_ssl=path     a path to static SSL libraries
     extra_sysroot=path  a path to extra development environment (Fink, Homebrew, MacPorts, MinGW)
     bits=[32bit|64bit]
+    install=path        install files under path
+    version_script=[0|1] Use version script (default 1)
+    crc32c_no_hardware=[0|1] disable building hardware support for CRC32C
 ''')
 # bpostatic option added on Percona request
 
@@ -75,22 +96,22 @@ opt_flags    = ' -g -O3 -fno-omit-frame-pointer -DNDEBUG'
 compile_arch = ''
 link_arch    = ''
 
-with_ssl     = ''
-
 # Build directory
 build_dir    = ''
 
+# Version script file
+galera_script = File('#/galera/src/galera-sym.map').abspath
 
 #
 # Read commandline options
 #
 
 build_dir = ARGUMENTS.get('build_dir', '')
-with_ssl = ARGUMENTS.get('with_ssl', '/usr/lib64')
 
 # Debug/dbug flags
 debug = ARGUMENTS.get('debug', -1)
 dbug  = ARGUMENTS.get('dbug', False)
+asan = ARGUMENTS.get('asan', 0)
 
 debug_lvl = int(debug)
 if debug_lvl >= 0 and debug_lvl < 3:
@@ -124,20 +145,31 @@ elif machine == 's390x':
 
 boost      = int(ARGUMENTS.get('boost', 1))
 boost_pool = int(ARGUMENTS.get('boost_pool', 0))
-static_ssl = int(ARGUMENTS.get('static_ssl', 0))
-ssl        = int(ARGUMENTS.get('ssl', 1))
+system_asio= int(ARGUMENTS.get('system_asio', 1))
 tests      = int(ARGUMENTS.get('tests', 1))
-strict_build_flags = int(ARGUMENTS.get('strict_build_flags', 1))
+# Run only tests which are known to be deterministic
+deterministic_tests = int(ARGUMENTS.get('deterministic_tests', 0))
+# Run all tests
+all_tests = int(ARGUMENTS.get('all_tests', 0))
+strict_build_flags = int(ARGUMENTS.get('strict_build_flags', 0))
+static_ssl = ARGUMENTS.get('static_ssl', None)
+install = ARGUMENTS.get('install', None)
+version_script = int(ARGUMENTS.get('version_script', 1))
 
-
-GALERA_VER = ARGUMENTS.get('version', '3.19')
+GALERA_VER = ARGUMENTS.get('version', '3.48')
 GALERA_REV = ARGUMENTS.get('revno', 'XXXX')
+
+# Attempt to read from file if not given
+if GALERA_REV == "XXXX" and os.path.isfile("GALERA_REVISION"):
+    with open("GALERA_REVISION", "r") as f:
+        GALERA_REV = f.readline().rstrip("\n")
+
 # export to any module that might have use of those
 Export('GALERA_VER', 'GALERA_REV')
-print 'Signature: version: ' + GALERA_VER + ', revision: ' + GALERA_REV
+print('Signature: version: ' + GALERA_VER + ', revision: ' + GALERA_REV)
 
 LIBBOOST_PROGRAM_OPTIONS_A = ARGUMENTS.get('bpostatic', '')
-LIBBOOST_SYSTEM_A = string.replace(LIBBOOST_PROGRAM_OPTIONS_A, 'boost_program_options', 'boost_system')
+LIBBOOST_SYSTEM_A = LIBBOOST_PROGRAM_OPTIONS_A.replace('boost_program_options', 'boost_system')
 
 #
 # Set up and export default build environment
@@ -165,22 +197,36 @@ link = os.getenv('LINK', 'default')
 if link != 'default':
     env.Replace(LINK = link)
 
+# Get compiler name/version, CXX may be set to "c++" which may be clang or gcc
+cc_version = str(read_first_line(env['CC'].split() + ['--version']))
+cxx_version = str(read_first_line(env['CXX'].split() + ['--version']))
+
+if python_ver >= 3:
+    cc_version = cc_version.decode()
+    cxx_version = cxx_version.decode()
+
+print('Using C compiler executable: ' + env['CC'])
+print('C compiler version is: ' + cc_version)
+print('Using C++ compiler executable: ' + env['CXX'])
+print('C++ compiler version is: ' + cxx_version)
+
 # Initialize CPPFLAGS and LIBPATH from environment to get user preferences
-env.Replace(CPPFLAGS = os.getenv('CPPFLAGS', ''))
-env.Replace(CCFLAGS = os.getenv('CCFLAGS', ''))
-env.Replace(CFLAGS = os.getenv('CFLAGS', ''))
-env.Replace(CXXFLAGS = os.getenv('CXXFLAGS', ''))
-env.Replace(LINKFLAGS = os.getenv('LDFLAGS', ''))
-env.Replace(LIBPATH = [os.getenv('LIBPATH', '')])
+env.Replace(CPPFLAGS  = os.getenv('CPPFLAGS', ''))
+env.Replace(CCFLAGS   = os.getenv('CCFLAGS',  opt_flags + compile_arch))
+env.Replace(CFLAGS    = os.getenv('CFLAGS',   ''))
+env.Replace(CXXFLAGS  = os.getenv('CXXFLAGS', ''))
+env.Replace(LINKFLAGS = os.getenv('LDFLAGS',  link_arch))
+env.Replace(LIBPATH   = [os.getenv('LIBPATH', '')])
+env.Replace(RPATH     = [os.getenv('RPATH',   '')])
 
 # Set -pthread flag explicitly to make sure that pthreads are
 # enabled on all platforms.
 env.Append(CCFLAGS = ' -pthread')
 
-# Freebsd ports are installed under /usr/local
+# FreeBSD ports are usually installed under /usr/local
 if sysname == 'freebsd' or sysname == 'sunos':
-    env.Append(LIBPATH  = ['/usr/local/lib'])
-    env.Append(CCFLAGS = ' -I/usr/local/include ')
+    env.Append(LIBPATH = ['/usr/local/lib'])
+    env.Append(CPPPATH = ['/usr/local/include'])
 if sysname == 'sunos':
    env.Replace(SHLINKFLAGS = '-shared ')
 
@@ -209,25 +255,29 @@ env.Append(CPPFLAGS = ' -DHAVE_COMMON_H')
 
 # Common C/CXX flags
 # These should be kept minimal as they are appended after C/CXX specific flags
-env.Append(CCFLAGS = opt_flags + compile_arch +
-                      ' -Wall -Wextra -Wno-unused-parameter')
+env.Append(CCFLAGS = ' -fPIC -Wall -Wextra -Wno-unused-parameter')
 
 # C-specific flags
-env.Append(CFLAGS = ' -std=c99 -fno-strict-aliasing -pipe')
+env.Prepend(CFLAGS = '-std=c99 -fno-strict-aliasing -pipe ')
 
 # CXX-specific flags
 # Note: not all 3rd-party libs like '-Wold-style-cast -Weffc++'
 #       adding those after checks
-env.Append(CXXFLAGS = ' -Wno-long-long -Wno-deprecated -ansi')
+env.Prepend(CXXFLAGS = '-Wno-long-long -Wno-deprecated -ansi ')
 if sysname != 'sunos':
-    env.Append(CXXFLAGS = ' -pipe')
+    env.Prepend(CXXFLAGS = '-pipe ')
 
 
 # Linker flags
 # TODO: enable ' -Wl,--warn-common -Wl,--fatal-warnings' after warnings from
 # static linking have beed addressed
 #
-#env.Append(LINKFLAGS = ' -Wl,--warn-common -Wl,--fatal-warnings')
+#env.Prepend(LINKFLAGS = '-Wl,--warn-common -Wl,--fatal-warnings ')
+
+if int(asan):
+    env.Append(CCFLAGS = ' -fsanitize=address')
+    env.Append(CPPFLAGS = ' -DGALERA_WITH_ASAN')
+    env.Append(LINKFLAGS = ' -fsanitize=address')
 
 #
 # Check required headers and libraries (autoconf functionality)
@@ -237,12 +287,29 @@ if sysname != 'sunos':
 # Custom tests:
 #
 
+def CheckCpp11(context):
+    test_source = """
+#if __cplusplus < 201103
+#error Not compiling in C++11 mode
+#endif
+int main() { return 0; }
+"""
+    context.Message('Checking if compiling in C++11 mode ... ')
+    result = context.TryLink(test_source, '.cpp')
+    context.Result(result)
+    return result
+
 def CheckSystemASIOVersion(context):
     system_asio_test_source_file = """
 #include <asio.hpp>
 
-#if ASIO_VERSION < 101001
-#error "Included asio version is too old"
+#define XSTR(x) STR(x)
+#define STR(x) #x
+#pragma message "Asio version:" XSTR(ASIO_VERSION)
+#if ASIO_VERSION < 101008
+#error Included asio version is too old
+#elif ASIO_VERSION >= 101100
+#error Included asio version is too new
 #endif
 
 int main()
@@ -251,21 +318,107 @@ int main()
 }
 
 """
-    context.Message('Checking ASIO version (> 1.10.1) ... ')
+    context.Message('Checking ASIO version (>= 1.10.8 and < 1.11.0) ... ')
     result = context.TryLink(system_asio_test_source_file, '.cpp')
     context.Result(result)
     return result
 
+def CheckTr1Array(context):
+    test_source = """
+#include <tr1/array>
+int main() { std::tr1::array<int, 5> a; return 0; }
+"""
+    context.Message('Checking for std::tr1::array ... ')
+    result = context.TryLink(test_source, '.cpp')
+    context.Result(result)
+    return result
+
+def CheckTr1SharedPtr(context):
+    test_source = """
+#include <tr1/memory>
+int main() { int n; std::tr1::shared_ptr<int> p(&n); return 0; }
+"""
+    context.Message('Checking for std::tr1::shared_ptr ... ')
+    result = context.TryLink(test_source, '.cpp')
+    context.Result(result)
+    return result
+
+def CheckTr1UnorderedMap(context):
+    test_source = """
+#include <tr1/unordered_map>
+int main() { std::tr1::unordered_map<int, int> m; return 0; }
+"""
+    context.Message('Checking for std::tr1::unordered_map ... ')
+    result = context.TryLink(test_source, '.cpp')
+    context.Result(result)
+    return result
+
+def CheckWeffcpp(context):
+    # Some compilers (gcc <= 4.8 at least) produce a bogus warning for the code
+    # below when -Weffc++ is used.
+    test_source = """
+class A {};
+class B : public A {};
+int main() { return 0; }
+"""
+    context.Message('Checking whether to enable -Weffc++ ... ')
+    cxxflags_orig = context.env['CXXFLAGS']
+    context.env.Prepend(CXXFLAGS = '-Weffc++ -Werror ')
+    result = context.TryLink(test_source, '.cpp')
+    context.env.Replace(CXXFLAGS = cxxflags_orig)
+    context.Result(result)
+    return result
+
+# advanced SSL features
+def CheckSetEcdhAuto(context):
+    test_source = """
+#include <openssl/ssl.h>
+int main() { SSL_CTX* ctx=NULL; return !SSL_CTX_set_ecdh_auto(ctx, 1); }
+"""
+    context.Message('Checking for SSL_CTX_set_ecdh_auto() ... ')
+    result = context.TryLink(test_source, '.cpp')
+    context.Result(result)
+    return result
+
+def CheckSetTmpEcdh(context):
+    test_source = """
+#include <openssl/ssl.h>
+int main() { SSL_CTX* ctx=NULL; EC_KEY* ecdh=NULL; return !SSL_CTX_set_tmp_ecdh(ctx,ecdh); }
+"""
+    context.Message('Checking for SSL_CTX_set_tmp_ecdh_() ... ')
+    result = context.TryLink(test_source, '.cpp')
+    context.Result(result)
+    return result
+
+def CheckVersionScript(context):
+    test_source = """
+int main() { return 0; }
+"""
+    context.Message('Checking for --version-script linker option ... ')
+    result = context.TryLink(test_source, '.cpp')
+    context.Result(result)
+    return result
 
 #
-# Construct confuration context
+# Construct configuration context
 #
-conf = Configure(env, custom_tests = {'CheckSystemASIOVersion': CheckSystemASIOVersion})
+conf = Configure(env, custom_tests = {
+    'CheckCpp11': CheckCpp11,
+    'CheckSystemASIOVersion': CheckSystemASIOVersion,
+    'CheckTr1Array': CheckTr1Array,
+    'CheckTr1SharedPtr': CheckTr1SharedPtr,
+    'CheckTr1UnorderedMap': CheckTr1UnorderedMap,
+    'CheckWeffcpp': CheckWeffcpp,
+    'CheckSetEcdhAuto': CheckSetEcdhAuto,
+    'CheckSetTmpEcdh': CheckSetTmpEcdh
+})
+
+conf.env.Append(CPPPATH = [ '#/wsrep/src' ])
 
 # System headers and libraries
 
 if not conf.CheckLib('pthread'):
-    print 'Error: pthread library not found'
+    print('Error: pthread library not found')
     Exit(1)
 
 # libatomic may be needed on some 32bit platforms (and 32bit userland PPC64)
@@ -275,23 +428,23 @@ if not x86:
 
 if sysname != 'darwin':
     if not conf.CheckLib('rt'):
-        print 'Error: rt library not found'
+        print('Error: rt library not found')
         Exit(1)
 
 if sysname == 'freebsd':
     if not conf.CheckLib('execinfo'):
-        print 'Error: execinfo library not found'
+        print('Error: execinfo library not found')
         Exit(1)
 
 if sysname == 'sunos':
     if not conf.CheckLib('socket'):
-        print 'Error: socket library not found'
+        print('Error: socket library not found')
         Exit(1)
     if not conf.CheckLib('crypto'):
-        print 'Error: crypto library not found'
+        print('Error: crypto library not found')
         Exit(1)
     if not conf.CheckLib('nsl'):
-        print 'Error: nsl library not found'
+        print('Error: nsl library not found')
         Exit(1)
 
 if conf.CheckHeader('sys/epoll.h'):
@@ -307,7 +460,7 @@ elif conf.CheckHeader('sys/endian.h'):
 elif conf.CheckHeader('sys/byteorder.h'):
     conf.env.Append(CPPFLAGS = ' -DHAVE_SYS_BYTEORDER_H')
 elif sysname != 'darwin':
-    print 'can\'t find byte order information'
+    print('can\'t find byte order information')
     Exit(1)
 
 if conf.CheckHeader('execinfo.h'):
@@ -315,23 +468,42 @@ if conf.CheckHeader('execinfo.h'):
 
 # Additional C headers and libraries
 
-# boost headers
+cpp11 = conf.CheckCpp11()
 
-if not conf.CheckCXXHeader('boost/shared_ptr.hpp'):
-    print 'boost/shared_ptr.hpp not found or not usable'
-    Exit(1)
-conf.env.Append(CPPFLAGS = ' -DHAVE_BOOST_SHARED_PTR_HPP')
-
-if conf.CheckCXXHeader('unordered_map'):
-    conf.env.Append(CPPFLAGS = ' -DHAVE_UNORDERED_MAP')
-elif conf.CheckCXXHeader('tr1/unordered_map'):
-    conf.env.Append(CPPFLAGS = ' -DHAVE_TR1_UNORDERED_MAP')
+# array
+if cpp11:
+    conf.env.Append(CPPFLAGS = ' -DHAVE_STD_ARRAY')
+elif conf.CheckTr1Array():
+    conf.env.Append(CPPFLAGS = ' -DHAVE_TR1_ARRAY')
+elif conf.CheckCXXHeader('boost/array.hpp'):
+    conf.env.Append(CPPFLAGS = ' -DHAVE_BOOST_ARRAY_HPP')
 else:
-    if conf.CheckCXXHeader('boost/unordered_map.hpp'):
-        conf.env.Append(CPPFLAGS = ' -DHAVE_BOOST_UNORDERED_MAP_HPP')
-    else:
-        print 'no unordered map header available'
-        Exit(1)
+    print('no suitable array header found')
+    Exit(1)
+
+# shared_ptr
+if cpp11:
+    conf.env.Append(CPPFLAGS = ' -DHAVE_STD_SHARED_PTR')
+elif False and conf.CheckTr1SharedPtr():
+    # std::tr1::shared_ptr<> is not derived from std::auto_ptr<>
+    # this upsets boost in asio, so don't use tr1 version, use boost instead
+    conf.env.Append(CPPFLAGS = ' -DHAVE_TR1_SHARED_PTR')
+elif conf.CheckCXXHeader('boost/shared_ptr.hpp'):
+    conf.env.Append(CPPFLAGS = ' -DHAVE_BOOST_SHARED_PTR_HPP')
+else:
+    print('no suitable shared_ptr header found')
+    Exit(1)
+
+# unordered_map
+if cpp11:
+    conf.env.Append(CPPFLAGS = ' -DHAVE_STD_UNORDERED_MAP')
+elif conf.CheckTr1UnorderedMap():
+    conf.env.Append(CPPFLAGS = ' -DHAVE_TR1_UNORDERED_MAP')
+elif conf.CheckCXXHeader('boost/unordered_map.hpp'):
+    conf.env.Append(CPPFLAGS = ' -DHAVE_BOOST_UNORDERED_MAP_HPP')
+else:
+    print('no suitable unordered map header found')
+    Exit(1)
 
 # pool allocator
 if boost == 1:
@@ -356,7 +528,7 @@ if boost == 1:
     def check_boost_library(libBaseName, header, configuredLibPath, autoadd = 1):
         libName = libBaseName + boost_library_suffix
         if configuredLibPath != '' and not os.path.isfile(configuredLibPath):
-            print "Error: file '%s' does not exist" % configuredLibPath
+            print("Error: file '%s' does not exist" % configuredLibPath)
             Exit(1)
         if configuredLibPath == '':
            for libpath in boost_libpaths:
@@ -366,7 +538,7 @@ if boost == 1:
                    break
         if configuredLibPath != '':
             if not conf.CheckCXXHeader(header):
-                print "Error: header '%s' does not exist" % header
+                print("Error: header '%s' does not exist" % header)
                 Exit (1)
             if autoadd:
                 conf.env.Append(LIBS=File(configuredLibPath))
@@ -377,7 +549,7 @@ if boost == 1:
                                            header=header,
                                            language='CXX',
                                            autoadd=autoadd):
-                print 'Error: library %s does not exist' % libName
+                print('Error: library %s does not exist' % libName)
                 Exit (1)
             return [libName]
 
@@ -385,7 +557,7 @@ if boost == 1:
     #
     if boost_pool == 1:
         if conf.CheckCXXHeader('boost/pool/pool_alloc.hpp'):
-            print 'Using boost pool alloc'
+            print('Using boost pool alloc')
             conf.env.Append(CPPFLAGS = ' -DGALERA_USE_BOOST_POOL_ALLOC=1')
             # due to a bug in boost >= 1.50 we need to link with boost_system
             # - should be a noop with no boost_pool.
@@ -396,7 +568,7 @@ if boost == 1:
                                 'boost/system/error_code.hpp',
                                 LIBBOOST_SYSTEM_A)
         else:
-            print 'Error: boost/pool/pool_alloc.hpp not found or not usable'
+            print('Error: boost/pool/pool_alloc.hpp not found or not usable')
             Exit(1)
 
     libboost_program_options = check_boost_library('boost_program_options',
@@ -404,65 +576,98 @@ if boost == 1:
                                                    LIBBOOST_PROGRAM_OPTIONS_A,
                                                    autoadd = 0)
 else:
-    print 'Not using boost'
+    print('Not using boost')
 
 # asio
-use_system_asio = False
-if conf.CheckCXXHeader('asio.hpp') and conf.CheckSystemASIOVersion():
-    use_system_asio = True
-    conf.env.Append(CPPFLAGS = ' -DHAVE_SYSTEM_ASIO -DHAVE_ASIO_HPP')
+if system_asio == 1 and conf.CheckCXXHeader('asio.hpp') and conf.CheckSystemASIOVersion():
+    conf.env.Append(CPPFLAGS = ' -DHAVE_ASIO_HPP')
 else:
-    print "Falling back to bundled asio"
+    system_asio = False
+    print("Falling back to bundled asio")
 
-if not use_system_asio:
-    # Fall back to embedded asio
-    conf.env.Append(CPPPATH = [ '#/asio' ])
+if not system_asio:
+    # Make sure that -Iasio goes before other paths (e.g. -I/usr/local/include)
+    # that may contain a system wide installed asio. We should use the bundled
+    # asio if "scons system_asio=0" is specified. Thus use Prepend().
+    conf.env.Prepend(CPPPATH = [ '#/asio' ])
     if conf.CheckCXXHeader('asio.hpp'):
         conf.env.Append(CPPFLAGS = ' -DHAVE_ASIO_HPP')
     else:
-        print 'asio headers not found or not usable'
+        print('asio headers not found or not usable')
         Exit(1)
 
 # asio/ssl
-if ssl == 1:
-    if conf.CheckCXXHeader('asio/ssl.hpp'):
-        conf.env.Append(CPPFLAGS = ' -DHAVE_ASIO_SSL_HPP')
-    else:
-        print 'ssl support required but asio/ssl.hpp not found or not usable'
-        print 'compile with ssl=0 or check that openssl devel headers are usable'
+if not conf.CheckCXXHeader('asio/ssl.hpp'):
+    print('SSL support required but asio/ssl.hpp was not found or not usable')
+    print('check that SSL devel headers are installed and usable')
+    Exit(1)
+
+def check_static_lib(path, libname):
+    fqfilename = path + "/lib" + libname + '.a'
+    if os.path.isfile(fqfilename):
+        conf.env.Append(LIBS = File(fqfilename))
+        return True
+    return False
+
+if static_ssl:
+    if not check_static_lib(static_ssl, "ssl"):
+        print("Static SSL linkage requested but ssl libary not found from {}"
+              .format(static_ssl))
         Exit(1)
-    if static_ssl == 0:
-        if conf.CheckLib('ssl'):
-            conf.CheckLib('crypto')
-        else:
-            print 'ssl support required but openssl library not found'
-            print 'compile with ssl=0 or check that openssl library is usable'
-            Exit(1)
-    else:
-        conf.env.Append(LIBPATH  = [with_ssl])
-        if conf.CheckLib('libssl.a', autoadd=0) or \
-            conf.CheckLib('libcrypto.a', autoadd=0) or \
-            conf.CheckLib('libz.a', autoadd=0):
-            pass
-        else:
-            print 'ssl support required but openssl library (static) not found'
-            print 'compile with ssl=0 or check that' 
-            print 'openssl static librares - libssl.a, libcrypto.a, libz.a are available'
-            Exit(1)
+    if not check_static_lib(static_ssl, "crypto"):
+        print("Static SSL requested but crypto libary not found from {}"
+              .format(static_ssl))
+        Exit(1)
+    conf.CheckLib('pthread')
+    conf.CheckLib('dl')
+    conf.env.Append(LDFLAGS = ' -static-libgcc')
+else:
+    if not conf.CheckLib('ssl'):
+        print('SSL support required but libssl was not found')
+        Exit(1)
+    if not conf.CheckLib('crypto'):
+        print('SSL support required libcrypto was not found')
+        Exit(1)
 
+# advanced SSL features
+if conf.CheckSetEcdhAuto():
+    conf.env.Append(CPPFLAGS = ' -DOPENSSL_HAS_SET_ECDH_AUTO')
+elif conf.CheckSetTmpEcdh():
+    conf.env.Append(CPPFLAGS = ' -DOPENSSL_HAS_SET_TMP_ECDH')
 
-# these will be used only with our softaware
+# these will be used only with our software
 if strict_build_flags == 1:
-    conf.env.Append(CCFLAGS  = ' -pedantic -Werror')
-    if 'clang' not in conf.env['CXX']:
-        conf.env.Append(CXXFLAGS = ' -Weffc++ -Wold-style-cast')
-    else:
-        conf.env.Append(CCFLAGS = ' -Wno-self-assign')
-        if 'ccache' in conf.env['CXX']:
+    conf.env.Append(CCFLAGS = ' -Werror ')
+    if 'clang' in cxx_version:
+        conf.env.Append(CCFLAGS  = ' -Wno-self-assign')
+        conf.env.Append(CCFLAGS  = ' -Wno-gnu-zero-variadic-macro-arguments')
+        conf.env.Append(CXXFLAGS = ' -Wno-variadic-macros')
+        # CXX may be something like "ccache clang++"
+        if 'ccache' in conf.env['CXX'] or 'ccache' in conf.env['CC']:
             conf.env.Append(CCFLAGS = ' -Qunused-arguments')
+# Enable libstdc++ assertions in debug build.
+if int(debug) >= 0:
+    conf.env.Append(CXXFLAGS = " -D_GLIBCXX_ASSERTIONS")
+
+if conf.CheckWeffcpp():
+    conf.env.Prepend(CXXFLAGS = '-Weffc++ ')
+
+if not 'clang' in cxx_version:
+    conf.env.Prepend(CXXFLAGS = '-Wold-style-cast ')
 
 env = conf.Finish()
-Export('x86', 'bits', 'env', 'sysname', 'libboost_program_options', 'static_ssl', 'with_ssl')
+
+print('Global flags:')
+for f in ['CFLAGS', 'CXXFLAGS', 'CCFLAGS', 'CPPFLAGS']:
+    print(f + ': ' + env[f].strip())
+
+Export('machine',
+       'x86',
+       'bits',
+       'env',
+       'sysname',
+       'libboost_program_options',
+       'install')
 
 #
 # Actions to build .dSYM directories, containing debugging information for Darwin
@@ -479,20 +684,25 @@ if sysname == 'darwin' and int(debug) >= 0 and int(debug) < 3:
 # Clone base from default environment
 check_env = env.Clone()
 
+if not x86:
+    # don't attempt to run the legacy protocol tests that use unaligned memory
+    # access on platforms that are not known to handle it well.
+    check_env.Append(CPPFLAGS = ' -DGALERA_ONLY_ALIGNED')
+
 conf = Configure(check_env)
 
 # Check header and library
 
 if not conf.CheckHeader('check.h'):
-    print 'Error: check header file not found or not usable'
+    print('Error: check header file not found or not usable')
     Exit(1)
 
 if not conf.CheckLib('check'):
-    print 'Error: check library not found or not usable'
+    print('Error: check library not found or not usable')
     Exit(1)
 
 if not conf.CheckLib('m'):
-    print 'Error: math library not found or not usable'
+    print('Error: math library not found or not usable')
     Exit(1)
 
 # potential check dependency, link if present
@@ -500,9 +710,27 @@ conf.CheckLib('subunit')
 
 if sysname != 'darwin':
     if not conf.CheckLib('rt'):
-        print 'Error: realtime library not found or not usable'
+        print('Error: realtime library not found or not usable')
         Exit(1)
 
+conf.Finish()
+
+#
+# Check version script linker option
+#
+
+test_env = env.Clone()
+# Append version script flags to general link options for test
+test_env.Append(LINKFLAGS = ' -Wl,--version-script=' + galera_script)
+
+conf = Configure(test_env, custom_tests = {
+    'CheckVersionScript': CheckVersionScript,
+})
+
+if version_script:
+    has_version_script = conf.CheckVersionScript()
+else:
+    has_version_script = False
 conf.Finish()
 
 #
@@ -527,7 +755,15 @@ else:
 check_env.Append(BUILDERS = {'Test' :  bld})
 
 Export('check_env')
+Export('has_version_script galera_script')
 
+#
+# If deterministic_tests is given, export GALERA_TEST_DETERMINISTIC
+# so that the non-deterministic tests can be filtered out.
+#
+if deterministic_tests:
+   os.environ['GALERA_TEST_DETERMINISTIC'] = '1'
+Export('deterministic_tests all_tests')
 #
 # Run root SConscript with variant_dir
 #

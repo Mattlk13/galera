@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2014 Codership Oy <info@codership.com>
+ * Copyright (C) 2008-2020 Codership Oy <info@codership.com>
  *
  * $Id$
  */
@@ -155,6 +155,7 @@ typedef enum gcs_act_type
     GCS_ACT_FLOW,       //! flow control
     GCS_ACT_SERVICE,    //! service action, sent by GCS
     GCS_ACT_ERROR,      //! error happened while receiving the action
+    GCS_ACT_INCONSISTENCY,//! inconsistency event
     GCS_ACT_UNKNOWN     //! undefined/unknown action type
 }
 gcs_act_type_t;
@@ -280,9 +281,11 @@ extern long gcs_resume_recv (gcs_conn_t* conn);
  * After action with this seqno is applied, this thread is guaranteed to see
  * all the changes made by the client, even on other nodes.
  *
- * @return global sequence number or negative error code
+ * @retval 0       success
+ * @retval -EPERM  operation not permitted (in NON_PRIMARY state)
+ * @retval -EAGAIN operation may be retried later (in transient state)
  */
-extern gcs_seqno_t gcs_caused(gcs_conn_t* conn);
+extern long gcs_caused (gcs_conn_t* conn, gcs_seqno_t& seqno);
 
 /*! @brief Sends state transfer request
  * Broadcasts state transfer request which will be passed to one of the
@@ -417,21 +420,14 @@ typedef struct gcs_act_conf {
                                 *  incoming address, 8-byte cached seqno) */
 } gcs_act_conf_t;
 
-typedef struct gcs_backend_stats {
-    struct stats_t {
-        const char* key;
-        const char* value;
-    }* stats;
-    void* ctx;
-} gcs_backend_stats_t;
-
 struct gcs_stats
 {
     double    send_q_len_avg; //! average send queue length per send call
     double    recv_q_len_avg; //! average recv queue length per queued action
     long long fc_paused_ns;   //! total nanoseconds spent in paused state
     double    fc_paused_avg;  //! faction of time paused due to flow control
-    long long fc_sent;        //! flow control stops sent
+    long long fc_ssent;       //! flow control stops sent
+    long long fc_csent;       //! flow control conts sent
     long long fc_received;    //! flow control stops received
     size_t    recv_q_size;    //! current recv queue size
     int       recv_q_len;     //! current recv queue length
@@ -440,7 +436,8 @@ struct gcs_stats
     int       send_q_len;     //! current send queue length
     int       send_q_len_max; //! maximum send queue length
     int       send_q_len_min; //! minimum send queue length
-    gcs_backend_stats_t backend_stats; //! backend stats.
+    bool      fc_active;      //! flow control is currently active
+    bool      fc_requested;   //! flow control is requested by this node
 };
 
 /*! Fills stats struct */
@@ -449,6 +446,8 @@ extern void gcs_get_stats (gcs_conn_t *conn, struct gcs_stats* stats);
 extern void gcs_flush_stats(gcs_conn_t *conn);
 
 void gcs_get_status(gcs_conn_t* conn, gu::Status& status);
+
+extern void gcs_join_notification(gcs_conn_t *conn);
 
 /*! A node with this name will be treated as a stateless arbitrator */
 #define GCS_ARBITRATOR_NAME "garb"

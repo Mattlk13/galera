@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2010 Codership Oy <info@codership.com>
+ * Copyright (C) 2010-2019 Codership Oy <info@codership.com>
  */
 
 
@@ -13,10 +13,9 @@
 #include "gcomm/conf.hpp"
 
 #include "gu_logger.hpp"
+#include "gu_shared_ptr.hpp"
 
 #include <boost/bind.hpp>
-#include <boost/shared_ptr.hpp>
-#include <boost/enable_shared_from_this.hpp>
 
 #include <fstream>
 
@@ -28,16 +27,13 @@ gcomm::AsioProtonet::AsioProtonet(gu::Config& conf, int version)
     poll_until_(gu::datetime::Date::max()),
     io_service_(),
     timer_(io_service_),
-#ifdef HAVE_ASIO_SSL_HPP
     ssl_context_(io_service_, asio::ssl::context::sslv23),
-#endif // HAVE_ASIO_SSL_HPP
     mtu_(1 << 15),
     checksum_(NetHeader::checksum_type(
                   conf.get<int>(gcomm::Conf::SocketChecksum,
                                 NetHeader::CS_CRC32C)))
 {
     conf.set(gcomm::Conf::SocketChecksum, checksum_);
-#ifdef HAVE_ASIO_SSL_HPP
     // use ssl if either private key or cert file is specified
     bool use_ssl(conf_.is_set(gu::conf::ssl_key)  == true ||
                  conf_.is_set(gu::conf::ssl_cert) == true);
@@ -54,7 +50,6 @@ gcomm::AsioProtonet::AsioProtonet(gu::Config& conf, int version)
         log_info << "initializing ssl context";
         gu::ssl_prepare_context(conf_, ssl_context_);
     }
-#endif // HAVE_ASIO_SSL_HPP
 }
 
 gcomm::AsioProtonet::~AsioProtonet()
@@ -78,11 +73,11 @@ gcomm::SocketPtr gcomm::AsioProtonet::socket(const gu::URI& uri)
 {
     if (uri.get_scheme() == "tcp" || uri.get_scheme() == "ssl")
     {
-        return boost::shared_ptr<AsioTcpSocket>(new AsioTcpSocket(*this, uri));
+        return gu::shared_ptr<AsioTcpSocket>::type(new AsioTcpSocket(*this, uri));
     }
     else if (uri.get_scheme() == "udp")
     {
-        return boost::shared_ptr<AsioUdpSocket>(new AsioUdpSocket(*this, uri));
+        return gu::shared_ptr<AsioUdpSocket>::type(new AsioUdpSocket(*this, uri));
     }
     else
     {
@@ -100,7 +95,7 @@ gcomm::Acceptor* gcomm::AsioProtonet::acceptor(const gu::URI& uri)
 gu::datetime::Period handle_timers_helper(gcomm::Protonet&            pnet,
                                           const gu::datetime::Period& period)
 {
-    const gu::datetime::Date now(gu::datetime::Date::now());
+    const gu::datetime::Date now(gu::datetime::Date::monotonic());
     const gu::datetime::Date stop(now + period);
 
     const gu::datetime::Date next_time(pnet.handle_timers());
@@ -112,7 +107,7 @@ gu::datetime::Period handle_timers_helper(gcomm::Protonet&            pnet,
 void gcomm::AsioProtonet::event_loop(const gu::datetime::Period& period)
 {
     io_service_.reset();
-    poll_until_ = gu::datetime::Date::now() + period;
+    poll_until_ = gu::datetime::Date::monotonic() + period;
 
     const gu::datetime::Period p(handle_timers_helper(*this, period));
     timer_.expires_from_now(boost::posix_time::nanosec(p.get_nsecs()));
@@ -142,7 +137,7 @@ void gcomm::AsioProtonet::interrupt()
 
 void gcomm::AsioProtonet::handle_wait(const asio::error_code& ec)
 {
-    gu::datetime::Date now(gu::datetime::Date::now());
+    gu::datetime::Date now(gu::datetime::Date::monotonic());
     const gu::datetime::Period p(handle_timers_helper(*this, poll_until_ - now));
     using std::rel_ops::operator>=;
     if (ec == asio::error_code() && poll_until_ >= now)

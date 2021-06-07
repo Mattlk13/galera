@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2010-2012 Codership Oy <info@codership.com>
+ * Copyright (C) 2010-2017 Codership Oy <info@codership.com>
  */
 
 #include "asio_udp.hpp"
@@ -7,8 +7,9 @@
 #include "gcomm/util.hpp"
 #include "gcomm/common.hpp"
 
+#include "gu_array.hpp"
+
 #include <boost/bind.hpp>
-#include <boost/array.hpp>
 
 
 static bool is_multicast(const asio::ip::udp::endpoint& ep)
@@ -88,11 +89,10 @@ void gcomm::AsioUdpSocket::connect(const gu::URI& uri)
     asio::ip::udp::socket::non_blocking_io cmd(true);
     socket_.io_control(cmd);
 
-    const std::string if_addr(
-        gu::unescape_addr(
+    const asio::ip::address local_if(
+        gu::make_address(
             uri.get_option("socket.if_addr",
                            gu::any_addr(conn_i->endpoint().address()))));
-    asio::ip::address local_if(asio::ip::address::from_string(if_addr));
 
     if (is_multicast(conn_i->endpoint()) == true)
     {
@@ -131,10 +131,10 @@ void gcomm::AsioUdpSocket::close()
     state_ = S_CLOSED;
 }
 
-int gcomm::AsioUdpSocket::send(const Datagram& dg)
+int gcomm::AsioUdpSocket::send(int /* segment */, const Datagram& dg)
 {
     Critical<AsioProtonet> crit(net_);
-    boost::array<asio::const_buffer, 3> cbs;
+    gu::array<asio::const_buffer, 3>::type cbs;
     NetHeader hdr(dg.len(), net_.version_);
 
     if (net_.checksum_ != NetHeader::CS_NONE)
@@ -147,7 +147,7 @@ int gcomm::AsioUdpSocket::send(const Datagram& dg)
     cbs[0] = asio::const_buffer(buf, sizeof(buf));
     cbs[1] = asio::const_buffer(dg.header() + dg.header_offset(),
                           dg.header_len());
-    cbs[2] = asio::const_buffer(&dg.payload()[0], dg.payload().size());
+    cbs[2] = asio::const_buffer(dg.payload().data(), dg.payload().size());
     try
     {
         socket_.send_to(cbs, target_ep_);
@@ -219,7 +219,7 @@ void gcomm::AsioUdpSocket::read_handler(const asio::error_code& ec,
 void gcomm::AsioUdpSocket::async_receive()
 {
     Critical<AsioProtonet> crit(net_);
-    boost::array<asio::mutable_buffer, 1> mbs;
+    gu::array<asio::mutable_buffer, 1>::type mbs;
     mbs[0] = asio::mutable_buffer(&recv_buf_[0], recv_buf_.size());
     socket_.async_receive_from(mbs, source_ep_,
                                boost::bind(&AsioUdpSocket::read_handler,

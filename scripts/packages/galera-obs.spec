@@ -16,7 +16,8 @@
 # MA  02110-1301  USA.
 
 %{!?name: %define name galera-3}
-%{!?version: %define version 25_3.x}
+%{!?wsrep_api: %define wsrep_api 25}
+%{!?version: %define version %{wsrep_api}_3.x}
 %{!?release: %define release 2}
 %define revision XXXX
 %define copyright Copyright 2007-2015 Codership Oy. All rights reserved. Use is subject to license terms under GPLv2 license.
@@ -28,7 +29,7 @@
 %global _enable_debug_package 0
 %global debug_package %{nil}
 %global __os_install_post /usr/lib/rpm/brp-compress %{nil}
-
+%define ssl_package_devel openssl-devel
 # Define dist tag if not given by platform
 
 # For suse versions see:
@@ -44,6 +45,10 @@
 %endif
 %if 0%{?suse_version} == 1320
 %define dist .suse13.2
+%endif
+%if 0%{?sle_version} == 150000 && 0%{?is_opensuse}
+%define dist .lp151
+%define ssl_package_devel libopenssl-devel
 %endif
 
 
@@ -63,8 +68,14 @@ BuildRoot:     %{_tmppath}/%{name}_%{version}-build
 BuildRequires: boost-devel >= 1.41
 BuildRequires: check-devel
 BuildRequires: glibc-devel
-BuildRequires: openssl-devel
+BuildRequires: %{ssl_package_devel}
+%if 0%{?rhel} >= 8 || 0%{?centos} >= 8
+BuildRequires: python3-scons
+%define scons_cmd scons-3
+%else
 BuildRequires: scons
+%define scons_cmd scons
+%endif
 %if 0%{?suse_version} == 1110
 # On SLES11 SPx use the linked gcc47 to build instead of default gcc43
 BuildRequires: gcc47 gcc47-c++
@@ -124,7 +135,7 @@ Provides:      galera, galera3, Percona-XtraDB-Cluster-galera-25
 %description
 Galera is a fast synchronous multimaster wsrep provider (replication engine)
 for transactional databases and similar applications. For more information
-about wsrep API see http://launchpad.net/wsrep. For a description of Galera
+about wsrep API see https://github.com/codership/wsrep-API. For a description of Galera
 replication engine see http://www.codership.com.
 
 %{copyright}
@@ -156,7 +167,7 @@ export CXX=g++-4.7
 
 NUM_JOBS=${NUM_JOBS:-$(ncpu=$(cat /proc/cpuinfo | grep processor | wc -l) && echo $(($ncpu > 4 ? 4 : $ncpu)))}
 
-scons -j$(echo $NUM_JOBS) revno=%{revision}
+%{scons_cmd} -j$(echo $NUM_JOBS) revno=%{revision} deterministic_tests=1
 
 %install
 RBR=$RPM_BUILD_ROOT # eg. rpmbuild/BUILDROOT/galera-3-3.x-33.1.x86_64
@@ -206,7 +217,6 @@ install -d "$RPM_BUILD_ROOT/%{_sharedstatedir}/galera"
 install -d $RBR%{docs}
 install -m 644 $RBD/COPYING                       $RBR%{docs}/COPYING
 install -m 644 $RBD/asio/LICENSE_1_0.txt          $RBR%{docs}/LICENSE.asio
-install -m 644 $RBD/www.evanjones.ca/LICENSE      $RBR%{docs}/LICENSE.crc32c
 install -m 644 $RBD/chromium/LICENSE              $RBR%{docs}/LICENSE.chromium
 install -m 644 $RBD/scripts/packages/README       $RBR%{docs}/README
 install -m 644 $RBD/scripts/packages/README-MySQL $RBR%{docs}/README-MySQL
@@ -316,7 +326,6 @@ fi
 %attr(0755,root,root) %dir %{docs}
 %doc %attr(0644,root,root) %{docs}/COPYING
 %doc %attr(0644,root,root) %{docs}/LICENSE.asio
-%doc %attr(0644,root,root) %{docs}/LICENSE.crc32c
 %doc %attr(0644,root,root) %{docs}/LICENSE.chromium
 %doc %attr(0644,root,root) %{docs}/README
 %doc %attr(0644,root,root) %{docs}/README-MySQL
