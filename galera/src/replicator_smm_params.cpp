@@ -1,4 +1,4 @@
-/* Copyright (C) 2012-2015 Codership Oy <info@codersip.com> */
+/* Copyright (C) 2012-2018 Codership Oy <info@codersip.com> */
 
 #include "replicator_smm.hpp"
 #include "gcs.hpp"
@@ -25,7 +25,7 @@ const std::string galera::ReplicatorSMM::Param::key_format =
 const std::string galera::ReplicatorSMM::Param::max_write_set_size =
     common_prefix + "max_ws_size";
 
-int const galera::ReplicatorSMM::MAX_PROTO_VER(7);
+int const galera::ReplicatorSMM::MAX_PROTO_VER(9);
 
 galera::ReplicatorSMM::Defaults::Defaults() : map_()
 {
@@ -113,7 +113,7 @@ galera::ReplicatorSMM::InitConfig::InitConfig(gu::Config&       conf,
     gcache::GCache::register_params(conf);
     if (gcs_register_params(reinterpret_cast<gu_config_t*>(&conf)))
     {
-        gu_throw_fatal << "Error intializing GCS parameters";
+        gu_throw_fatal << "Error initializing GCS parameters";
     }
     Certification::register_params(conf);
     ist::register_params(conf);
@@ -124,8 +124,9 @@ galera::ReplicatorSMM::ParseOptions::ParseOptions(Replicator&       repl,
                                                   gu::Config&       conf,
                                                   const char* const opts)
 {
-    try {
-        conf.parse(opts);
+    try
+    {
+        if (opts) conf.parse(opts);
     }
     catch (gu::NotFound) {}
 
@@ -211,19 +212,21 @@ galera::ReplicatorSMM::param_set (const std::string& key,
     if (defaults.map_.find(key) != defaults.map_.end() ||
         key                     == Param::base_host) // is my key?
     {
-        found = true;
         set_param (key, value);
-        config_.set (key, value);
+        found = true;
+        config_.set(key, value);
     }
 
-    if (key == Certification::PARAM_LOG_CONFLICTS)
-    {
-        cert_.set_log_conflicts(value);
-        return;
-    }
     // this key might be for another module
     else if (0 != key.find(common_prefix))
     {
+        try
+        {
+            cert_.param_set (key, value);
+            found = true;
+        }
+        catch (gu::NotFound&) {}
+
         try
         {
             gcs_.param_set (key, value);

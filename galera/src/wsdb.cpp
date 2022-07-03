@@ -9,6 +9,7 @@
 #include "gu_lock.hpp"
 #include "gu_throw.hpp"
 
+#include <algorithm>
 
 void galera::Wsdb::print(std::ostream& os) const
 {
@@ -47,10 +48,38 @@ galera::Wsdb::~Wsdb()
              << " conn query map usage " << conn_map_.size();
     log_info << trx_pool_;
 
+    /* There is potential race when a user triggers update of wsrep_provider
+    that leads to deinit/unload of the provider. deinit/unload action of
+    provider waits for replication to end. stop_replication routine waits
+    for any active monitors for get released. But once monitors are
+    released before the connection or transaction handle is discarded
+    if deinit/unload sequence try to free up/destruct the provider user may
+    hit the below mentioned assert. (that too in release mode only).
+
+    In normal flow, case shouldn't arise but if the case shows-up then
+    waiting for few seconds should help schedule release of connection and
+    transaction handle.
+    Even if wait doesn't help then it suggest some other serious issue
+    that is blocking release of connection/transaction handle.
+    In such case let the server assert as per the original flow.
+    assert at this level should be generally safe given provider
+    is unloading. */
+
+    uint count = 5;
+    while((trx_map_.size() != 0 || conn_map_.size() != 0) && count != 0)
+    {
+        log_info << "giving timeslice for connection/transaction handle"
+                 << " to get released";
+        sleep(1);
+        --count;
+    }
+
     // With debug builds just print trx and query maps to stderr
     // and don't clean up to let valgrind etc to detect leaks.
 #ifndef NDEBUG
-    std::cerr << *this;
+    log_info << *this;
+    assert(trx_map_.size() == 0);
+    assert(conn_map_.size() == 0);
 #else
     for_each(trx_map_.begin(), trx_map_.end(), Unref2nd<TrxMap::value_type>());
     for_each(conn_trx_map_.begin(),
@@ -215,15 +244,6 @@ void galera::Wsdb::discard_conn_query(wsrep_conn_id_t conn_id)
     if ((i = conn_map_.find(conn_id)) != conn_map_.end())
     {
         i->second.assign_trx(0);
-    }
-}
-
-void galera::Wsdb::discard_conn(wsrep_conn_id_t conn_id)
-{
-    gu::Lock lock(conn_mutex_);
-    ConnMap::iterator i;
-    if ((i = conn_map_.find(conn_id)) != conn_map_.end())
-    {
         conn_map_.erase(i);
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2010 Codership Oy <info@codership.com>
+ * Copyright (C) 2010-2019 Codership Oy <info@codership.com>
  */
 
 #ifndef GCOMM_ASIO_TCP_HPP
@@ -7,23 +7,32 @@
 
 #include "socket.hpp"
 #include "asio_protonet.hpp"
+#include "fair_send_queue.hpp"
+
+#include "gu_array.hpp"
+#include "gu_shared_ptr.hpp"
 
 #include <boost/bind.hpp>
-#include <boost/array.hpp>
-#include <boost/enable_shared_from_this.hpp>
 #include <vector>
 #include <deque>
 
 //
-// Boost enable_shared_from_this<> does not have virtual destructor,
-// therefore need to ignore -Weffc++
+// Boost and std:: enable_shared_from_this<> does not have virtual destructor,
+// therefore need to ignore -Weffc++ and -Wnon-virtual-dtor
 //
 #if defined(__GNUG__)
 # if (__GNUC__ == 4 && __GNUC_MINOR__ >= 6) || (__GNUC__ > 4)
 #  pragma GCC diagnostic push
 # endif // (__GNUC__ == 4 && __GNUC_MINOR__ >= 6) || (__GNUC__ > 4)
 # pragma GCC diagnostic ignored "-Weffc++"
+# pragma GCC diagnostic ignored "-Wnon-virtual-dtor"
 #endif
+
+/**
+ * Configuration value denoting automatic buffer size adjustment for
+ * socket.recv_buf_size and socket.send_buf_size.
+ */
+#define GCOMM_ASIO_AUTO_BUF_SIZE "auto"
 
 namespace gcomm
 {
@@ -36,22 +45,20 @@ namespace gcomm
 
 class gcomm::AsioTcpSocket :
     public gcomm::Socket,
-    public boost::enable_shared_from_this<AsioTcpSocket>
+    public gu::enable_shared_from_this<AsioTcpSocket>::type
 {
 public:
     AsioTcpSocket(AsioProtonet& net, const gu::URI& uri);
     ~AsioTcpSocket();
     void failed_handler(const asio::error_code& ec, const std::string& func, int line);
-#ifdef HAVE_ASIO_SSL_HPP
     void handshake_handler(const asio::error_code& ec);
-#endif // HAVE_ASIO_SSL_HPP
     void connect_handler(const asio::error_code& ec);
     void connect(const gu::URI& uri);
     void close();
     void write_handler(const asio::error_code& ec,
                        size_t bytes_transferred);
     void set_option(const std::string& key, const std::string& val);
-    int send(const Datagram& dg);
+    int send(int segment, const Datagram& dg);
     size_t read_completion_condition(
         const asio::error_code& ec,
         const size_t bytes_transferred);
@@ -63,6 +70,7 @@ public:
     std::string remote_addr() const;
     State state() const { return state_; }
     SocketId id() const { return &socket_; }
+    SocketStats stats() const;
 private:
     friend class gcomm::AsioTcpAcceptor;
     friend class gcomm::AsioPostForSendHandler;
@@ -71,8 +79,14 @@ private:
     void operator=(const AsioTcpSocket&);
 
     void set_socket_options();
-    void read_one(boost::array<asio::mutable_buffer, 1>& mbs);
-    void write_one(const boost::array<asio::const_buffer, 2>& cbs);
+    void set_buf_sizes();
+    void init_tstamps()
+    {
+        gu::datetime::Date now(gu::datetime::Date::monotonic());
+        last_queued_tstamp_ = last_delivered_tstamp_ = now;
+    }
+    void read_one(gu::array<asio::mutable_buffer, 1>::type& mbs);
+    void write_one(const gu::array<asio::const_buffer, 2>::type& cbs);
     void close_socket();
 
     // call to assign local/remote addresses at the point where it
@@ -89,12 +103,18 @@ private:
 
     AsioProtonet&                             net_;
     asio::ip::tcp::socket                     socket_;
-#ifdef HAVE_ASIO_SSL_HPP
     asio::ssl::stream<asio::ip::tcp::socket>* ssl_socket_;
-#endif // HAVE_ASIO_SSL_HPP
-    std::deque<Datagram>                      send_q_;
+    // Limit the number of queued bytes. This workaround to avoid queue
+    // pile up due to frequent retransmissions by the upper layers (evs).
+    // It is a responsibility of upper layers (evs) to request resending
+    // of dropped messaes. Upper limit (32MB) is enough to hold 1024
+    // datagrams with default gcomm MTU 32kB.
+    static const size_t                       max_send_q_bytes = (1 << 25);
+    gcomm::FairSendQueue                      send_q_;
+    gu::datetime::Date                        last_queued_tstamp_;
     std::vector<gu::byte_t>                   recv_buf_;
     size_t                                    recv_offset_;
+    gu::datetime::Date                        last_delivered_tstamp_;
     State                                     state_;
     // Querying addresses from failed socket does not work,
     // so need to maintain copy for diagnostics logging
@@ -121,9 +141,7 @@ public:
 
     AsioTcpAcceptor(AsioProtonet& net, const gu::URI& uri);
     ~AsioTcpAcceptor();
-    void accept_handler(
-        SocketPtr socket,
-        const asio::error_code& error);
+    void set_buf_sizes();
     void listen(const gu::URI& uri);
     std::string listen_addr() const;
     void close();
@@ -137,6 +155,10 @@ public:
     SocketId id() const { return &acceptor_; }
 
 private:
+    void accept_handler(
+        SocketPtr socket,
+        const asio::error_code& error);
+
     AsioProtonet& net_;
     asio::ip::tcp::acceptor acceptor_;
     SocketPtr accepted_socket_;

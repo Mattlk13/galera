@@ -1,8 +1,6 @@
 //
-// Copyright (C) 2016 Codership Oy <info@codership.com>
+// Copyright (C) 2016-2020 Codership Oy <info@codership.com>
 //
-
-
 
 #include "gu_thread.hpp"
 #include <sstream>
@@ -15,19 +13,19 @@ START_TEST(check_thread_schedparam_parse)
 
     std::ostringstream oss;
     oss << sp_other;
-    fail_unless(oss.str() == "other:0", "'%s'", oss.str().c_str());
+    ck_assert_msg(oss.str() == "other:0", "'%s'", oss.str().c_str());
 
     oss.str("");
 
     gu::ThreadSchedparam sp_fifo(SCHED_FIFO, 95);
     oss << sp_fifo;
-    fail_unless(oss.str() == "fifo:95", "'%s'", oss.str().c_str());
+    ck_assert_msg(oss.str() == "fifo:95", "'%s'", oss.str().c_str());
 
     oss.str("");
 
     gu::ThreadSchedparam sp_rr(SCHED_RR, 96);
     oss << sp_rr;
-    fail_unless(oss.str() == "rr:96", "'%s'", oss.str().c_str());
+    ck_assert_msg(oss.str() == "rr:96", "'%s'", oss.str().c_str());
 
 
 }
@@ -36,17 +34,17 @@ END_TEST
 START_TEST(check_thread_schedparam_system_default)
 {
 
-    gu::ThreadSchedparam sp(gu::thread_get_schedparam(pthread_self()));
+    gu::ThreadSchedparam sp(gu::thread_get_schedparam(gu_thread_self()));
     std::ostringstream sp_oss;
     sp_oss << sp;
 
     std::ostringstream system_default_oss;
     system_default_oss << gu::ThreadSchedparam::system_default;
 
-    fail_unless(sp == gu::ThreadSchedparam::system_default,
-                "sp '%s' != system default '%s'",
-                sp_oss.str().c_str(),
-                system_default_oss.str().c_str());
+    ck_assert_msg(sp == gu::ThreadSchedparam::system_default,
+                  "sp '%s' != system default '%s'",
+                  sp_oss.str().c_str(),
+                  system_default_oss.str().c_str());
 }
 END_TEST
 

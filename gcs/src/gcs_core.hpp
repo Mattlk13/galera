@@ -125,8 +125,7 @@ gcs_core_send (gcs_core_t*          core,
 extern ssize_t
 gcs_core_recv (gcs_core_t*          conn,
                struct gcs_act_rcvd* recv_act,
-               long long            timeout,
-               bool*                sync_sent_ref = NULL);
+               long long            timeout);
 
 /* group protocol version */
 extern gcs_proto_t
@@ -155,8 +154,8 @@ gcs_core_send_sync (gcs_core_t* core, gcs_seqno_t seqno);
 extern long
 gcs_core_send_fc (gcs_core_t* core, const void* fc, size_t fc_size);
 
-extern gcs_seqno_t
-gcs_core_caused(gcs_core_t* core);
+extern long
+gcs_core_caused (gcs_core_t* core, gcs_seqno_t& seqno);
 
 extern long
 gcs_core_param_set (gcs_core_t* core, const char* key, const char* value);

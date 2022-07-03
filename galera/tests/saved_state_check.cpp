@@ -1,17 +1,16 @@
 /*
- * Copyright (C) 2012 Codership Oy <info@codership.com>
+ * Copyright (C) 2012-2020 Codership Oy <info@codership.com>
  */
 
 #include "../src/saved_state.hpp"
 
 #include "../src/uuid.hpp"
 
+#include "gu_inttypes.hpp"
+
 #include <check.h>
 #include <errno.h>
-#include <pthread.h>
-
-#define __STDC_FORMAT_MACROS
-#include <inttypes.h>
+#include <gu_threads.h>
 
 static volatile bool stop(false);
 
@@ -33,7 +32,12 @@ thread_routine (void* arg)
 }
 
 static const int max_threads(16);
-static pthread_t threads[max_threads];
+static gu_thread_t threads[max_threads];
+#if defined(GALERA_WITH_VALGRIND)
+static const int iterations(10);
+#else
+static const int iterations(100);
+#endif // GALERA_WITH_VALGRIND
 
 static void
 start_threads(void* arg)
@@ -42,10 +46,10 @@ start_threads(void* arg)
 
     for (int ret = 0; ret < max_threads; ++ret)
     {
-        pthread_t t;
-        int err = pthread_create (&t, NULL, thread_routine, arg);
-        fail_if (err, "Failed to start thread %d: %d (%s)",
-                 ret, err, strerror(err));
+        gu_thread_t t;
+        int err = gu_thread_create (&t, NULL, thread_routine, arg);
+        ck_assert_msg(0 == err, "Failed to start thread %d: %d (%s)",
+                      ret, err, strerror(err));
         threads[ret] = t;
     }
 }
@@ -57,7 +61,7 @@ stop_threads()
 
     for (int t = 0; t < max_threads; ++t)
     {
-        pthread_join(threads[t], NULL);
+        gu_thread_join(threads[t], NULL);
     }
 }
 
@@ -67,7 +71,8 @@ START_TEST(test_basic)
 {
     unlink (fname);
 
-    wsrep_uuid_t  uuid;
+    union { wsrep_uuid_t uuid; gu_word_t align; } aligned;
+    wsrep_uuid_t& uuid(aligned.uuid);
     wsrep_seqno_t seqno;
     bool safe_to_bootstrap;
 
@@ -76,9 +81,9 @@ START_TEST(test_basic)
 
         st.get(uuid, seqno, safe_to_bootstrap);
 
-        fail_if (uuid  != WSREP_UUID_UNDEFINED);
-        fail_if (seqno != WSREP_SEQNO_UNDEFINED);
-        fail_if (safe_to_bootstrap != true);
+        ck_assert(uuid  == WSREP_UUID_UNDEFINED);
+        ck_assert(seqno == WSREP_SEQNO_UNDEFINED);
+        ck_assert(safe_to_bootstrap == true);
 
         gu_uuid_from_string("b2c01654-8dfe-11e1-0800-a834d641cfb5",
                             to_gu_uuid(uuid));
@@ -96,9 +101,9 @@ START_TEST(test_basic)
 
         st.get(u, s, stb);
 
-        fail_if (u != uuid);
-        fail_if (s != seqno);
-        fail_if (stb != false);
+        ck_assert(u == uuid);
+        ck_assert(s == seqno);
+        ck_assert(stb == false);
     }
 }
 END_TEST
@@ -109,19 +114,20 @@ START_TEST(test_unsafe)
 {
     SavedState st(fname);
 
-    wsrep_uuid_t  uuid;
+    union { wsrep_uuid_t uuid; gu_word_t align; } aligned;
+    wsrep_uuid_t& uuid(aligned.uuid);
     wsrep_seqno_t seqno;
     bool safe_to_bootstrap;
 
     st.get(uuid, seqno, safe_to_bootstrap);
 
-    fail_if (uuid  == WSREP_UUID_UNDEFINED);
-    fail_if (seqno == WSREP_SEQNO_UNDEFINED);
-    fail_if (safe_to_bootstrap == true);
+    ck_assert(uuid  != WSREP_UUID_UNDEFINED);
+    ck_assert(seqno != WSREP_SEQNO_UNDEFINED);
+    ck_assert(safe_to_bootstrap != true);
 
     st.set(uuid, WSREP_SEQNO_UNDEFINED, false);
 
-    for (int i = 0; i < 100; ++i)
+    for (int i = 0; i < iterations; ++i)
     {
         start_threads(&st);
         mark_point();
@@ -133,9 +139,9 @@ START_TEST(test_unsafe)
         mark_point();
         st.get(uuid, seqno, safe_to_bootstrap);
 
-        fail_if (uuid == WSREP_UUID_UNDEFINED);
-        fail_if (seqno != i);
-        fail_if (safe_to_bootstrap != false);
+        ck_assert(uuid != WSREP_UUID_UNDEFINED);
+        ck_assert(seqno == i);
+        ck_assert(safe_to_bootstrap == false);
     }
 
     long marks, locks, writes;
@@ -151,7 +157,8 @@ END_TEST
 
 START_TEST(test_corrupt)
 {
-    wsrep_uuid_t  uuid;
+    union { wsrep_uuid_t uuid; gu_word_t align; } aligned;
+    wsrep_uuid_t& uuid(aligned.uuid);
     wsrep_seqno_t seqno;
     bool safe_to_bootstrap;
 
@@ -160,16 +167,16 @@ START_TEST(test_corrupt)
 
         st.get(uuid, seqno, safe_to_bootstrap);
 
-        fail_if (uuid  == WSREP_UUID_UNDEFINED);
-        fail_if (seqno == WSREP_SEQNO_UNDEFINED);
-        fail_if (safe_to_bootstrap == true);
+        ck_assert(uuid  != WSREP_UUID_UNDEFINED);
+        ck_assert(seqno != WSREP_SEQNO_UNDEFINED);
+        ck_assert(safe_to_bootstrap != true);
 
         st.set(uuid, WSREP_SEQNO_UNDEFINED, false);
     }
 
     long marks(0), locks(0), writes(0);
 
-    for (int i = 0; i < 100; ++i)
+    for (int i = 0; i < iterations; ++i)
     {
         SavedState st(fname);
         // explicitly overwrite corruption mark.
@@ -191,9 +198,9 @@ START_TEST(test_corrupt)
         st.get(u, s, stb);
 
         // make sure that mark_corrupt() stays
-        fail_if (u != WSREP_UUID_UNDEFINED);
-        fail_if (s != WSREP_SEQNO_UNDEFINED);
-        fail_if (stb != false);
+        ck_assert(u == WSREP_UUID_UNDEFINED);
+        ck_assert(s == WSREP_SEQNO_UNDEFINED);
+        ck_assert(stb == false);
 
         long m, l, w;
 
@@ -212,9 +219,6 @@ START_TEST(test_corrupt)
     unlink (fname);
 }
 END_TEST
-
-#define WAIT_FOR(cond)                                                  \
-    { int count = 1000; while (--count && !(cond)) { usleep (TEST_USLEEP); }}
 
 Suite* saved_state_suite()
 {

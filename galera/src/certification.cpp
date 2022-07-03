@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2010-2014 Codership Oy <info@codership.com>
+// Copyright (C) 2010-2018 Codership Oy <info@codership.com>
 //
 
 #include "certification.hpp"
@@ -9,6 +9,7 @@
 #include "gu_throw.hpp"
 
 #include <map>
+#include <algorithm> // std::for_each
 
 using namespace galera;
 
@@ -18,11 +19,12 @@ static const bool cert_debug_on(false);
     else log_info << "cert debug: "
 
 #define CERT_PARAM_LOG_CONFLICTS galera::Certification::PARAM_LOG_CONFLICTS
+#define CERT_PARAM_OPTIMISTIC_PA galera::Certification::PARAM_OPTIMISTIC_PA
 
 static std::string const CERT_PARAM_PREFIX("cert.");
 
-std::string const galera::Certification::PARAM_LOG_CONFLICTS(CERT_PARAM_PREFIX +
-                                                             "log_conflicts");
+std::string const CERT_PARAM_LOG_CONFLICTS(CERT_PARAM_PREFIX + "log_conflicts");
+std::string const CERT_PARAM_OPTIMISTIC_PA(CERT_PARAM_PREFIX + "optimistic_pa");
 
 static std::string const CERT_PARAM_MAX_LENGTH   (CERT_PARAM_PREFIX +
                                                   "max_length");
@@ -30,6 +32,7 @@ static std::string const CERT_PARAM_LENGTH_CHECK (CERT_PARAM_PREFIX +
                                                   "length_check");
 
 static std::string const CERT_PARAM_LOG_CONFLICTS_DEFAULT("no");
+static std::string const CERT_PARAM_OPTIMISTIC_PA_DEFAULT("yes");
 
 /*** It is EXTREMELY important that these constants are the same on all nodes.
  *** Don't change them ever!!! ***/
@@ -40,6 +43,7 @@ void
 galera::Certification::register_params(gu::Config& cnf)
 {
     cnf.add(CERT_PARAM_LOG_CONFLICTS, CERT_PARAM_LOG_CONFLICTS_DEFAULT);
+    cnf.add(CERT_PARAM_OPTIMISTIC_PA, CERT_PARAM_OPTIMISTIC_PA_DEFAULT);
     /* The defaults below are deliberately not reflected in conf: people
      * should not know about these dangerous setting unless they read RTFM. */
     cnf.add(CERT_PARAM_MAX_LENGTH);
@@ -118,7 +122,6 @@ galera::Certification::purge_for_trx_v3(TrxHandle* trx)
     for (long i = 0; i < keys.count(); ++i)
     {
         const KeySet::KeyPart& kp(keys.next());
-        KeySet::Key::Prefix const p(kp.prefix());
 
         KeyEntryNG ke(kp);
         CertIndexNG::iterator const ci(cert_index_ng_.find(&ke));
@@ -132,6 +135,8 @@ galera::Certification::purge_for_trx_v3(TrxHandle* trx)
 
         KeyEntryNG* const kep(*ci);
         assert(kep->referenced());
+
+        wsrep_key_type_t const p(kp.wsrep_type(trx->version()));
 
         if (kep->ref_trx(p) == trx)
         {
@@ -473,78 +478,123 @@ cert_fail:
     return TEST_FAILED;
 }
 
-
-/*! for convenience returns true if conflict and false if not */
-static inline bool
-certify_and_depend_v3(const galera::KeyEntryNG*   const found,
-                      const galera::KeySet::KeyPart&    key,
-                      galera::TrxHandle*          const trx,
-                      bool                        const log_conflict)
+/* Specifically for chain use in certify_and_depend_v3to4() */
+template <wsrep_key_type_t REF_KEY_TYPE>
+bool
+check_against(const galera::KeyEntryNG*   const found,
+              const galera::KeySet::KeyPart&    key,
+              wsrep_key_type_t            const key_type,
+              galera::TrxHandle*          const trx,
+              bool                        const log_conflict,
+              wsrep_seqno_t&                    depends_seqno)
 {
-    const galera::TrxHandle* const ref_trx(
-        found->ref_trx(galera::KeySet::Key::P_EXCLUSIVE));
-
-    if (cert_debug_on && ref_trx)
-    {
-        cert_debug << "exclusive match: "
-                   << *trx << " <-----> " << *ref_trx;
-    }
-
-    wsrep_seqno_t const ref_seqno(ref_trx ? ref_trx->global_seqno() : -1);
+    const galera::TrxHandle* const ref_trx(found->ref_trx(REF_KEY_TYPE));
 
     // trx should not have any references in index at this point
     assert(ref_trx != trx);
 
+    bool conflict(false);
+
     if (gu_likely(0 != ref_trx))
     {
+        if (REF_KEY_TYPE == WSREP_KEY_EXCLUSIVE && ref_trx)
+        {
+            cert_debug << KeySet::type(REF_KEY_TYPE) << " match: "
+                       << *trx << " <-----> " << *ref_trx;
+        }
+
+        if (REF_KEY_TYPE == WSREP_KEY_SHARED ||
+            REF_KEY_TYPE == WSREP_KEY_SEMI) assert(!ref_trx->is_toi());
+
         // cert conflict takes place if
         // 1) write sets originated from different nodes, are within cert range
         // 2) ref_trx is in isolation mode, write sets are within cert range
-        if ((trx->source_id() != ref_trx->source_id() || ref_trx->is_toi()) &&
-            ref_seqno >  trx->last_seen_seqno())
+        switch(REF_KEY_TYPE)
         {
-            if (gu_unlikely(log_conflict == true))
-            {
-                log_info << "trx conflict for key " << key << ": "
-                         << *trx << " <--X--> " << *ref_trx;
-            }
-            return true;
+        case WSREP_KEY_EXCLUSIVE:
+            conflict = ref_trx->is_toi();
+            /* fall through */
+        case WSREP_KEY_SEMI:
+            conflict = (ref_trx->global_seqno() > trx->last_seen_seqno() &&
+                        (conflict || trx->source_id() != ref_trx->source_id()));
+            /* fall through */
+        case WSREP_KEY_SHARED:;
+        }
+
+        if (gu_unlikely(cert_debug_on || (conflict && log_conflict == true)))
+        {
+            log_info << KeySet::type(key_type) << '-'
+                     << KeySet::type(REF_KEY_TYPE)
+                     << " trx " << (conflict ? "conflict" : "match")
+                     << " for key " << key << ": "
+                     << *trx << " <---> " << *ref_trx;
+        }
+
+        if (conflict)
+        {
+            depends_seqno = -1;
+        }
+        else if (key_type     == WSREP_KEY_EXCLUSIVE ||
+                 REF_KEY_TYPE == WSREP_KEY_EXCLUSIVE)
+        {
+            depends_seqno = std::max(ref_trx->global_seqno(), depends_seqno);
         }
     }
 
-    wsrep_seqno_t depends_seqno(ref_seqno);
-    galera::KeySet::Key::Prefix const pfx (key.prefix());
-
-    if (pfx == galera::KeySet::Key::P_EXCLUSIVE)
-        // exclusive keys must depend on shared refs as well
-    {
-        const galera::TrxHandle* const ref_shared_trx(
-            found->ref_trx(galera::KeySet::Key::P_SHARED));
-
-        assert(ref_shared_trx != trx);
-
-        if (ref_shared_trx)
-        {
-            cert_debug << "shared match: "
-                       << *trx << " <-----> " << *ref_shared_trx;
-
-            depends_seqno = std::max(ref_shared_trx->global_seqno(),
-                                     depends_seqno);
-        }
-    }
-
-    trx->set_depends_seqno(std::max(trx->depends_seqno(), depends_seqno));
-
-    return false;
+    return conflict;
 }
 
+/*! for convenience returns true if conflict and false if not */
+static inline bool
+certify_and_depend_v3to4(const galera::KeyEntryNG*   const found,
+                         const galera::KeySet::KeyPart&    key,
+                         galera::TrxHandle*          const trx,
+                         bool                        const log_conflict)
+{
+    wsrep_seqno_t depends_seqno(trx->depends_seqno());
+    wsrep_key_type_t const key_type(key.wsrep_type(trx->version()));
+
+    /*
+     * The following cascade implements these rules:
+     *
+     *      | ex | ss | sh |  <- horizontal axis: trx   key type
+     *   -------------------     vertical   axis: found key type
+     *   ex | C  | C  | C  |
+     *   -------------------     C - conflict
+     *   ss | C  | N  | N  |     D - dependency
+     *   -------------------     N - nothing
+     *   sh | D  | N  | N  |
+     *   -------------------
+     *
+     * Note that depends_seqno is an in/out parameter and is updated on every
+     * step.
+     */
+    if (check_against<WSREP_KEY_EXCLUSIVE>
+        (found, key, key_type, trx, log_conflict, depends_seqno) ||
+        (key_type == WSREP_KEY_EXCLUSIVE &&
+         /* exclusive keys must be checked against shared */
+         (check_against<WSREP_KEY_SEMI>
+          (found, key, key_type, trx, log_conflict, depends_seqno) ||
+          check_against<WSREP_KEY_SHARED>
+          (found, key, key_type, trx, log_conflict, depends_seqno))))
+    {
+        return true;
+    }
+    else
+    {
+        if (depends_seqno > trx->depends_seqno())
+            trx->set_depends_seqno(depends_seqno);
+        return false;
+    }
+}
 
 /* returns true on collision, false otherwise */
 static bool
-certify_v3(galera::Certification::CertIndexNG& cert_index_ng,
-           const galera::KeySet::KeyPart&      key,
-           galera::TrxHandle*                  trx,
-           bool const store_keys, bool const   log_conflicts)
+certify_v3to4(galera::Certification::CertIndexNG& cert_index_ng,
+              const galera::KeySet::KeyPart&      key,
+              galera::TrxHandle*                  trx,
+              bool const                          store_keys,
+              bool const                          log_conflicts)
 {
     galera::KeyEntryNG ke(key);
     galera::Certification::CertIndexNG::iterator ci(cert_index_ng.find(&ke));
@@ -568,14 +618,14 @@ certify_v3(galera::Certification::CertIndexNG& cert_index_ng,
         // Note: For we skip certification for isolated trxs, only
         // cert index and key_list is populated.
         return (!trx->is_toi() &&
-                certify_and_depend_v3(kep, key, trx, log_conflicts));
+                certify_and_depend_v3to4(kep, key, trx, log_conflicts));
     }
 }
 
 galera::Certification::TestResult
-galera::Certification::do_test_v3(TrxHandle* trx, bool store_keys)
+galera::Certification::do_test_v3to4(TrxHandle* trx, bool store_keys)
 {
-    cert_debug << "BEGIN CERTIFICATION v3: " << *trx;
+    cert_debug << "BEGIN CERTIFICATION v" << trx->version() << ": " << *trx;
 
 #ifndef NDEBUG
     // to check that cleanup after cert failure returns cert_index_
@@ -587,23 +637,13 @@ galera::Certification::do_test_v3(TrxHandle* trx, bool store_keys)
     long const      key_count(key_set.count());
     long            processed(0);
 
-    // This check if the keys are appended.
-    // Generally almost all cases keys are appeneded before certification
-    // except in case of CTAS which is executed non-TOI fashion due to
-    // involvement of SELECT. If the source table is empty then no key
-    // is appended and so key_count == 0.
-    // Unfortunately there is no way to check if the original SQL statement
-    // is of type CTAS type but leaving this assert can cause random failure
-    // so we will disable it for now.
-    // assert(key_count > 0);
-
     key_set.rewind();
 
     for (; processed < key_count; ++processed)
     {
         const KeySet::KeyPart& key(key_set.next());
 
-        if (certify_v3(cert_index_ng_, key, trx, store_keys, log_conflicts_))
+        if (certify_v3to4(cert_index_ng_, key, trx, store_keys, log_conflicts_))
         {
             goto cert_fail;
         }
@@ -630,7 +670,7 @@ galera::Certification::do_test_v3(TrxHandle* trx, bool store_keys)
 
             KeyEntryNG* const kep(*ci);
 
-            kep->ref(k.prefix(), k, trx);
+            kep->ref(k.wsrep_type(trx->version()), k, trx);
 
         }
 
@@ -678,14 +718,14 @@ cert_fail:
                 delete kep;
 
             }
-            else if(ke.key().shared())
+            else if(ke.key().wsrep_type(trx->version()) == WSREP_KEY_SHARED)
             {
                 assert(0); // we actually should never be here, the key should
                            // be either added to cert_index_ or be there already
                 log_warn  << "could not find shared key '"
                           << ke.key() << "' from cert index";
             }
-            else { /* exclusive can duplicate shared */ }
+            else { /* non-shared keys can duplicate shared in the key set */ }
         }
         assert(cert_index_.size() == prev_cert_index_size);
     }
@@ -693,12 +733,30 @@ cert_fail:
     return TEST_FAILED;
 }
 
+/* Determine whether a given trx can be correctly certified under the
+ * certification protocol currently established in the group (cert_version)
+ * Certification protocols from 1 to 3 could only handle writesets of the same
+ * version. Certification protocol 4 can handle writesets of both version 3
+ * and 4 */
+static inline bool
+trx_cert_version_match(int const trx_version, int const cert_version)
+{
+    if (cert_version <= 3)
+    {
+        return (trx_version == cert_version);
+    }
+    else
+    {
+        return (trx_version >= 3 && trx_version <= cert_version);
+    }
+}
+
 galera::Certification::TestResult
 galera::Certification::do_test(TrxHandle* trx, bool store_keys)
 {
     assert(trx->source_id() != WSREP_UUID_UNDEFINED);
 
-    if (trx->version() != version_)
+    if (!trx_cert_version_match(trx->version(), version_))
     {
         log_warn << "trx protocol version: "
                  << trx->version()
@@ -745,6 +803,10 @@ galera::Certification::do_test(TrxHandle* trx, bool store_keys)
     {
         trx->set_depends_seqno(
             trx_map_.begin()->second->global_seqno() - 1);
+
+        if (optimistic_pa_ == false &&
+            trx->last_seen_seqno() > trx->depends_seqno())
+            trx->set_depends_seqno(trx->last_seen_seqno());
     }
 
     switch (version_)
@@ -754,7 +816,8 @@ galera::Certification::do_test(TrxHandle* trx, bool store_keys)
         res = do_test_v1to2(trx, store_keys);
         break;
     case 3:
-        res = do_test_v3(trx, store_keys);
+    case 4:
+        res = do_test_v3to4(trx, store_keys);
         break;
     default:
         gu_throw_fatal << "certification test for version "
@@ -817,14 +880,16 @@ galera::Certification::do_test_preordered(TrxHandle* trx)
 }
 
 
-galera::Certification::Certification(gu::Config& conf, ServiceThd& thd)
+galera::Certification::Certification(gu::Config& conf, ServiceThd& thd, gcache::GCache& gcache)
     :
     version_               (-1),
+    conf_                  (conf),
     trx_map_               (),
     cert_index_            (),
     cert_index_ng_         (),
     deps_set_              (),
     service_thd_           (thd),
+    gcache_                (gcache),
     mutex_                 (),
     trx_size_warn_count_   (0),
     initial_position_      (-1),
@@ -844,7 +909,8 @@ galera::Certification::Certification(gu::Config& conf, ServiceThd& thd)
 
     max_length_            (max_length(conf)),
     max_length_check_      (length_check(conf)),
-    log_conflicts_         (conf.get<bool>(CERT_PARAM_LOG_CONFLICTS))
+    log_conflicts_         (conf.get<bool>(CERT_PARAM_LOG_CONFLICTS)),
+    optimistic_pa_         (conf.get<bool>(CERT_PARAM_OPTIMISTIC_PA))
 {}
 
 
@@ -881,6 +947,7 @@ void galera::Certification::assign_initial_position(wsrep_seqno_t seqno,
     case 1:
     case 2:
     case 3:
+    case 4:
         break;
     default:
         gu_throw_fatal << "certification/trx version "
@@ -1075,7 +1142,7 @@ wsrep_seqno_t galera::Certification::set_trx_committed(TrxHandle* trx)
             deps_set_.erase(i);
         }
 
-        if (gu_unlikely(index_purge_required()))
+        if (gu_unlikely(gcache_.cleanup_required() || index_purge_required()))
         {
             ret = get_safe_to_discard_seqno_();
         }
@@ -1100,23 +1167,46 @@ galera::TrxHandle* galera::Certification::get_trx(wsrep_seqno_t seqno)
 }
 
 void
-galera::Certification::set_log_conflicts(const std::string& str)
+set_boolean_parameter(bool& param,
+                      const std::string& value,
+                      const std::string& param_name,
+                      const std::string& change_msg)
 {
     try
     {
-        bool const old(log_conflicts_);
-        log_conflicts_ = gu::Config::from_config<bool>(str);
-        if (old != log_conflicts_)
+        bool const old(param);
+        param = gu::Config::from_config<bool>(value);
+        if (old != param)
         {
-            log_info << (log_conflicts_ ? "Enabled" : "Disabled")
-                     << " logging of certification conflicts.";
+            log_info << (param ? "Enabled " : "Disabled ") << change_msg;
         }
     }
     catch (gu::NotFound& e)
     {
-        gu_throw_error(EINVAL) << "Bad value '" << str
+        gu_throw_error(EINVAL) << "Bad value '" << value
                                << "' for boolean parameter '"
-                               << CERT_PARAM_LOG_CONFLICTS << '\'';
+                               << param_name << '\'';
     }
 }
 
+void
+galera::Certification::param_set(const std::string& key,
+                                 const std::string& value)
+{
+    if (key == Certification::PARAM_LOG_CONFLICTS)
+    {
+        set_boolean_parameter(log_conflicts_, value, CERT_PARAM_LOG_CONFLICTS,
+                              "logging of certification conflicts.");
+    }
+    else if (key == Certification::PARAM_OPTIMISTIC_PA)
+    {
+        set_boolean_parameter(optimistic_pa_, value, CERT_PARAM_OPTIMISTIC_PA,
+                              "\"optimistic\" parallel applying.");
+    }
+    else
+    {
+        throw gu::NotFound();
+    }
+
+    conf_.set(key, value);
+}

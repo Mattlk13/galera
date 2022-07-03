@@ -7,10 +7,13 @@
 
 #include "gcomm/util.hpp"
 
+#include "gu_lock.hpp"
 #include "gu_logger.hpp"
 #include "gu_macros.h"
 #include <algorithm>
 #include <set>
+
+#include <boost/bind.hpp>
 
 using std::rel_ops::operator!=;
 using std::rel_ops::operator>;
@@ -155,7 +158,7 @@ void gcomm::pc::Proto::send_state()
     }
 }
 
-void gcomm::pc::Proto::send_install(bool bootstrap, int weight)
+int gcomm::pc::Proto::send_install(bool bootstrap, int weight)
 {
     gcomm_assert(bootstrap == false || weight == -1);
     log_debug << self_id() << " send install";
@@ -204,6 +207,7 @@ void gcomm::pc::Proto::send_install(bool bootstrap, int weight)
         log_warn << self_id() << " sending install message failed: "
                  << strerror(ret);
     }
+    return ret;
 }
 
 
@@ -317,25 +321,20 @@ void gcomm::pc::Proto::shift_to(const State s)
     // State graph
     static const bool allowed[S_MAX][S_MAX] = {
 
-        // Closed
-        { false, false,  false, false, false, true },
-        // States exch
-        { true,  false, true,  false, true,  true  },
-        // Install
-        { true,  false, false, true,  true,  true  },
-        // Prim
-        { true,  false, false, false, true,  true  },
-        // Trans
-        { true,  true,  false, false, false, true  },
-        // Non-prim
-        { true,  false,  false, true, true,  true  }
+        // Cl     S-E    IN     P      Trans  N-P
+        {  false, false, false, false, false, true  }, // Closed
+        {  true,  false, true,  false, true,  true  }, // States exch
+        {  true,  false, false, true,  true,  true  }, // Install
+        {  true,  false, false, false, true,  true  }, // Prim
+        {  true,  true,  false, false, false, true  }, // Trans
+        {  true,  false, false,  true, true,  true  }  // Non-prim
     };
 
 
 
     if (allowed[state()][s] == false)
     {
-        gu_throw_fatal << "Forbidden state transtion: "
+        gu_throw_fatal << "Forbidden state transition: "
                        << to_string(state()) << " -> " << to_string(s);
     }
 
@@ -472,20 +471,40 @@ static bool have_weights(const gcomm::NodeList& node_list,
     return true;
 }
 
+static bool node_list_intersection_comp(const gcomm::NodeList::value_type& vt1,
+                                        const gcomm::NodeList::value_type& vt2)
+{
+    return (vt1.first < vt2.first);
+}
+
+static gcomm::NodeList node_list_intersection(const gcomm::NodeList& nl1,
+                                              const gcomm::NodeList& nl2)
+{
+    gcomm::NodeList ret;
+    std::set_intersection(nl1.begin(), nl1.end(), nl2.begin(), nl2.end(),
+                          std::inserter(ret, ret.begin()),
+                          node_list_intersection_comp);
+    return ret;
+}
 
 bool gcomm::pc::Proto::have_quorum(const View& view, const View& pc_view) const
 {
+    // Compare only against members and left which were part of the pc_view.
+    gcomm::NodeList memb_intersection(
+        node_list_intersection(view.members(), pc_view.members()));
+    gcomm::NodeList left_intersection(
+        node_list_intersection(view.left(), pc_view.members()));
     if (have_weights(view.members(), instances_) &&
         have_weights(view.left(), instances_)    &&
         have_weights(pc_view.members(), instances_))
     {
-        return (weighted_sum(view.members(), instances_) * 2
-                + weighted_sum(view.left(), instances_) >
+        return (weighted_sum(memb_intersection, instances_) * 2
+                + weighted_sum(left_intersection, instances_) >
                 weighted_sum(pc_view.members(), instances_));
     }
     else
     {
-        return (view.members().size()*2 + view.left().size() >
+        return (memb_intersection.size()*2 + left_intersection.size() >
                 pc_view.members().size());
     }
 }
@@ -493,17 +512,22 @@ bool gcomm::pc::Proto::have_quorum(const View& view, const View& pc_view) const
 
 bool gcomm::pc::Proto::have_split_brain(const View& view) const
 {
+    // Compare only against members and left which were part of the pc_view.
+    gcomm::NodeList memb_intersection(
+        node_list_intersection(view.members(), pc_view_.members()));
+    gcomm::NodeList left_intersection(
+        node_list_intersection(view.left(), pc_view_.members()));
     if (have_weights(view.members(), instances_)  &&
         have_weights(view.left(), instances_)     &&
         have_weights(pc_view_.members(), instances_))
     {
-        return (weighted_sum(view.members(), instances_) * 2
-                + weighted_sum(view.left(), instances_) ==
+        return (weighted_sum(memb_intersection, instances_) * 2
+                + weighted_sum(left_intersection, instances_) ==
                 weighted_sum(pc_view_.members(), instances_));
     }
     else
     {
-        return (view.members().size()*2 + view.left().size() ==
+        return (memb_intersection.size()*2 + left_intersection.size() ==
                 pc_view_.members().size());
     }
 }
@@ -519,7 +543,7 @@ void gcomm::pc::Proto::handle_trans(const View& view)
     log_debug << self_id() << " \n\n current view " << current_view_
               << "\n\n next view " << view
               << "\n\n pc view " << pc_view_;
-
+    log_debug << *this;
     if (have_quorum(view, pc_view_) == false)
     {
         if (closing_ == false && ignore_sb_ == true && have_split_brain(view))
@@ -634,7 +658,22 @@ void gcomm::pc::Proto::handle_view(const View& view)
 }
 
 
-
+int gcomm::pc::Proto::cluster_weight() const
+{
+    int total_weight(0);
+    if (pc_view_.type() == V_PRIM)
+    {
+        for (NodeMap::const_iterator i(instances_.begin());
+             i != instances_.end(); ++i)
+        {
+            if (pc_view_.id() == i->second.last_prim())
+            {
+                total_weight += i->second.weight();
+            }
+        }
+    }
+    return total_weight;
+}
 
 // Validate state message agains local state
 void gcomm::pc::Proto::validate_state_msgs() const
@@ -951,7 +990,7 @@ bool gcomm::pc::Proto::is_prim() const
 
 void gcomm::pc::Proto::handle_state(const Message& msg, const UUID& source)
 {
-    gcomm_assert(msg.type() == Message::T_STATE);
+    gcomm_assert(msg.type() == Message::PC_T_STATE);
     gcomm_assert(state() == S_STATES_EXCH);
     gcomm_assert(state_msgs_.size() < current_view_.members().size());
     log_debug << self_id() << " handle state from " << source << " " << msg;
@@ -1095,7 +1134,7 @@ void gcomm::pc::Proto::handle_install(const Message& msg, const UUID& source)
         return;
     }
 
-    gcomm_assert(msg.type() == Message::T_INSTALL);
+    gcomm_assert(msg.type() == Message::PC_T_INSTALL);
     gcomm_assert(state() == S_INSTALL || state() == S_NON_PRIM);
 
     if ((msg.flags() & Message::F_BOOTSTRAP) == 0)
@@ -1220,7 +1259,7 @@ namespace
 void
 gcomm::pc::Proto::handle_trans_install(const Message& msg, const UUID& source)
 {
-    gcomm_assert(msg.type() == Message::T_INSTALL);
+    gcomm_assert(msg.type() == Message::PC_T_INSTALL);
     gcomm_assert(state() == S_TRANS);
     gcomm_assert(current_view_.type() == V_TRANS);
 
@@ -1412,7 +1451,7 @@ void gcomm::pc::Proto::handle_msg(const Message&   msg,
         FAIL
     };
 
-    static const Verdict verdicts[S_MAX][Message::T_MAX] = {
+    static const Verdict verdicts[S_MAX][Message::PC_T_MAX] = {
         // Msg types
         // NONE,   STATE,   INSTALL,  USER
         {  FAIL,   FAIL,    FAIL,     FAIL    },  // Closed
@@ -1445,13 +1484,21 @@ void gcomm::pc::Proto::handle_msg(const Message&   msg,
 
     switch (msg_type)
     {
-    case Message::T_STATE:
+    case Message::PC_T_STATE:
         gu_trace(handle_state(msg, um.source()));
         break;
-    case Message::T_INSTALL:
+    case Message::PC_T_INSTALL:
         gu_trace(handle_install(msg, um.source()));
+        {
+          gu::Lock lock(sync_param_mutex_);
+          if (param_sync_set_ && (um.source() == uuid()))
+          {
+              param_sync_set_ = false;
+              sync_param_cond_.signal();
+          }
+        }
         break;
-    case Message::T_USER:
+    case Message::PC_T_USER:
         gu_trace(handle_user(msg, rb, um));
         break;
     default:
@@ -1571,10 +1618,22 @@ int gcomm::pc::Proto::handle_down(Datagram& dg, const ProtoDownMeta& dm)
     return ret;
 }
 
+void gcomm::pc::Proto::sync_param()
+{
+    gu::Lock lock(sync_param_mutex_);
+
+    while(param_sync_set_) 
+    {
+        lock.wait(sync_param_cond_);
+    }
+}
 
 bool gcomm::pc::Proto::set_param(const std::string& key,
-                                 const std::string& value)
+                                 const std::string& value,
+                                 Protolay::sync_param_cb_t& sync_param_cb)
 {
+    bool ret;
+    
     if (key == gcomm::Conf::PcIgnoreSb)
     {
         ignore_sb_ = gu::from_string<bool>(value);
@@ -1596,7 +1655,8 @@ bool gcomm::pc::Proto::set_param(const std::string& key,
         }
         else
         {
-            send_install(true);
+            ret = send_install(true);
+            if (ret != 0) gu_throw_error(ret); 
         }
         return true;
     }
@@ -1616,7 +1676,18 @@ bool gcomm::pc::Proto::set_param(const std::string& key,
                                        << "' out of range";
             }
             weight_ = w;
-            send_install(false, weight_);
+            {
+                sync_param_cb = boost::bind(&gcomm::pc::Proto::sync_param, this);
+                gu::Lock lock(sync_param_mutex_);
+                param_sync_set_ = true;
+            }
+            ret = send_install(false, weight_);
+            if (ret != 0) 
+            { 
+                gu::Lock lock(sync_param_mutex_);
+                param_sync_set_ = false;
+                gu_throw_error(ret);
+            }
             return true;
         }
     }

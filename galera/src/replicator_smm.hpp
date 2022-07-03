@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2010-2014 Codership Oy <info@codership.com>
+// Copyright (C) 2010-2018 Codership Oy <info@codership.com>
 //
 
 //! @file replicator_smm.hpp
@@ -41,6 +41,7 @@ namespace galera
         {
             SST_NONE,
             SST_WAIT,
+            SST_JOIN_SENT,
             SST_REQ_FAILED,
             SST_CANCELED,
             SST_FAILED
@@ -87,11 +88,6 @@ namespace galera
         void discard_local_conn_trx(wsrep_conn_id_t conn_id)
         {
             wsdb_.discard_conn_query(conn_id);
-        }
-
-        void discard_local_conn(wsrep_conn_id_t conn_id)
-        {
-            wsdb_.discard_conn(conn_id);
         }
 
         void apply_trx(void* recv_ctx, TrxHandle* trx);
@@ -353,11 +349,13 @@ namespace galera
                 case BYPASS:
                     gu_throw_fatal
                         << "commit order condition called in bypass mode";
+                    // fall through
                 case OOOC:
                     return true;
                 case LOCAL_OOOC:
                     if (trx_.is_local()) { return true; }
                     // in case of remote trx fall through
+                    // fall through
                 case NO_OOOC:
                     return (last_left + 1 == trx_.global_seqno());
                 }
@@ -513,17 +511,19 @@ namespace galera
 
         static int const       MAX_PROTO_VER;
         /*
-         * |------------------------------------------------------
-         * | protocol_version_ |  trx  version  | str_proto_ver_ |
-         * |------------------------------------------------------
-         * |                 1 |              1 |              0 |
-         * |                 2 |              1 |              1 |
-         * |                 3 |              2 |              1 |
-         * |                 4 |              2 |              1 |
-         * |                 5 |              3 |              1 |
-         * |                 6 |              3 |              2 |
-         * |                 7 |              3 |              2 |
-         * -------------------------------------------------------
+         * |--------------------------------------------------------------------|
+         * | protocol_version_ | trx version | str_proto_ver_ | record_set_ver_ |
+         * |--------------------------------------------------------------------|
+         * |                 1 |           1 |              0 |               1 |
+         * |                 2 |           1 |              1 |               1 |
+         * |                 3 |           2 |              1 |               1 |
+         * |                 4 |           2 |              1 |               1 |
+         * |                 5 |           3 |              1 |               1 |
+         * |                 6 |           3 |              2 |               1 |
+         * |                 7 |           3 |              2 |               1 |
+         * |                 8 |           3 |              2 |               2 |
+         * |                 9 |           4 |              2 |               2 |
+         * |--------------------------------------------------------------------|
          */
 
         int                    str_proto_ver_;// state transfer request protocol

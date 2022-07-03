@@ -1,25 +1,79 @@
 /*
- * Copyright (C) 2012 Codership Oy <info@codership.com>
+ * Copyright (C) 2012-2019 Codership Oy <info@codership.com>
  */
 
 #include "asio_tcp.hpp"
 #include "gcomm/util.hpp"
 #include "gcomm/common.hpp"
 
-
 #define FAILED_HANDLER(_e) failed_handler(_e, __FUNCTION__, __LINE__)
+
+// Helpers to set socket buffer sizes for both connecting
+// and listening sockets.
+
+static bool asio_recv_buf_warned(false);
+template <class Socket>
+void set_recv_buf_size_helper(const gu::Config& conf, Socket& socket)
+{
+    if (conf.get(gcomm::Conf::SocketRecvBufSize) != GCOMM_ASIO_AUTO_BUF_SIZE)
+    {
+        size_t const recv_buf_size
+            (conf.get<size_t>(gcomm::Conf::SocketRecvBufSize));
+        // this should have been checked already
+        assert(ssize_t(recv_buf_size) >= 0);
+
+        socket.set_option(asio::socket_base::receive_buffer_size(recv_buf_size));
+        asio::socket_base::receive_buffer_size option;
+        socket.get_option(option);
+        log_debug << "socket recv buf size " << option.value();
+        if (option.value() < ssize_t(recv_buf_size) && not asio_recv_buf_warned)
+        {
+            log_warn << "Receive buffer size " << option.value()
+                     << " less than requested " << recv_buf_size
+                     << ", this may affect performance in high latency/high "
+                     << "throughput networks.";
+            asio_recv_buf_warned = true;
+        }
+    }
+}
+
+static bool asio_send_buf_warned(false);
+template <class Socket>
+void set_send_buf_size_helper(const gu::Config& conf, Socket& socket)
+{
+    if (conf.get(gcomm::Conf::SocketSendBufSize) != GCOMM_ASIO_AUTO_BUF_SIZE)
+    {
+        size_t const send_buf_size
+            (conf.get<size_t>(gcomm::Conf::SocketSendBufSize));
+        // this should have been checked already
+        assert(ssize_t(send_buf_size) >= 0);
+
+        socket.set_option(asio::socket_base::send_buffer_size(send_buf_size));
+        asio::socket_base::send_buffer_size option;
+        socket.get_option(option);
+        log_debug << "socket send buf size " << option.value();
+        if (option.value() < ssize_t(send_buf_size) && not asio_send_buf_warned)
+        {
+            log_warn << "Send buffer size " << option.value()
+                     << " less than requested " << send_buf_size
+                     << ", this may affect performance in high latency/high "
+                     << "throughput networks.";
+            asio_send_buf_warned = true;
+        }
+    }
+}
 
 gcomm::AsioTcpSocket::AsioTcpSocket(AsioProtonet& net, const gu::URI& uri)
     :
     Socket       (uri),
     net_         (net),
     socket_      (net.io_service_),
-#ifdef HAVE_ASIO_SSL_HPP
     ssl_socket_  (0),
-#endif /* HAVE_ASIO_SSL_HPP */
     send_q_      (),
+    last_queued_tstamp_(),
     recv_buf_    (net_.mtu() + NetHeader::serial_size_),
     recv_offset_ (0),
+    last_delivered_tstamp_(),
     state_       (S_CLOSED),
     local_addr_  (),
     remote_addr_ ()
@@ -29,12 +83,10 @@ gcomm::AsioTcpSocket::AsioTcpSocket(AsioProtonet& net, const gu::URI& uri)
 
 gcomm::AsioTcpSocket::~AsioTcpSocket()
 {
-    log_debug << "dtor for " << id();
+    log_debug << "dtor for " << id() << " send q size " << send_q_.size();
     close_socket();
-#ifdef HAVE_ASIO_SSL_HPP
     delete ssl_socket_;
     ssl_socket_ = 0;
-#endif /* HAVE_ASIO_SSL_HPP */
 }
 
 void gcomm::AsioTcpSocket::failed_handler(const asio::error_code& ec,
@@ -65,7 +117,6 @@ void gcomm::AsioTcpSocket::failed_handler(const asio::error_code& ec,
     }
 }
 
-#ifdef HAVE_ASIO_SSL_HPP
 void gcomm::AsioTcpSocket::handshake_handler(const asio::error_code& ec)
 {
     if (ec)
@@ -93,16 +144,19 @@ void gcomm::AsioTcpSocket::handshake_handler(const asio::error_code& ec)
         return;
     }
 
+    const char* compression_name = gu::compression(*ssl_socket_);
+
     log_info << "SSL handshake successful, "
              << "remote endpoint " << remote_addr()
              << " local endpoint " << local_addr()
              << " cipher: " << gu::cipher(*ssl_socket_)
-             << " compression: " << gu::compression(*ssl_socket_);
+             << " compression: "
+             << (compression_name != NULL ? compression_name : "none");
     state_ = S_CONNECTED;
+    init_tstamps();
     net_.dispatch(id(), Datagram(), ProtoUpMeta(ec.value()));
     async_receive();
 }
-#endif /* HAVE_ASIO_SSL_HPP */
 
 void gcomm::AsioTcpSocket::connect_handler(const asio::error_code& ec)
 {
@@ -120,7 +174,6 @@ void gcomm::AsioTcpSocket::connect_handler(const asio::error_code& ec)
             assign_local_addr();
             assign_remote_addr();
             set_socket_options();
-#ifdef HAVE_ASIO_SSL_HPP
             if (ssl_socket_ != 0)
             {
                 log_debug << "socket " << id() << " connected, remote endpoint "
@@ -135,17 +188,15 @@ void gcomm::AsioTcpSocket::connect_handler(const asio::error_code& ec)
             }
             else
             {
-#endif /* HAVE_ASIO_SSL_HPP */
                 log_debug << "socket " << id() << " connected, remote endpoint "
                           << remote_addr() << " local endpoint "
                           << local_addr();
                 state_ = S_CONNECTED;
+                init_tstamps();
                 net_.dispatch(id(), Datagram(), ProtoUpMeta(ec.value()));
                 async_receive();
 
-#ifdef HAVE_ASIO_SSL_HPP
             }
-#endif /* HAVE_ASIO_SSL_HPP */
         }
     }
     catch (asio::system_error& e)
@@ -169,13 +220,14 @@ void gcomm::AsioTcpSocket::connect(const gu::URI& uri)
                   asio::ip::tcp::resolver::query::flags(0));
         asio::ip::tcp::resolver::iterator i(resolver.resolve(query));
 
-#ifdef HAVE_ASIO_SSL_HPP
         if (uri.get_scheme() == gu::scheme::ssl)
         {
             ssl_socket_ = new asio::ssl::stream<asio::ip::tcp::socket>(
                 net_.io_service_, net_.ssl_context_
             );
 
+            ssl_socket_->lowest_layer().open(i->endpoint().protocol());
+            set_buf_sizes(); // Must be done before connect
             ssl_socket_->lowest_layer().async_connect(
                 *i, boost::bind(&AsioTcpSocket::connect_handler,
                                 shared_from_this(),
@@ -184,30 +236,29 @@ void gcomm::AsioTcpSocket::connect(const gu::URI& uri)
         }
         else
         {
-#endif /* HAVE_ASIO_SSL_HPP */
-            const std::string bind_ip = uri.get_option(gcomm::Socket::OptIfAddr, "");
-            if (!bind_ip.empty()) {
-                socket_.open(i->endpoint().protocol());
-                asio::ip::tcp::endpoint ep(
-                    asio::ip::address::from_string(bind_ip),
-                    // connect from any port.
-                    0);
+            const std::string bind_ip(uri.get_option(
+                                          gcomm::Socket::OptIfAddr, ""));
+            socket_.open(i->endpoint().protocol());
+            if (!bind_ip.empty())
+            {
+                asio::ip::tcp::endpoint ep(gu::make_address(bind_ip), 0);
                 socket_.bind(ep);
             }
+            set_buf_sizes(); // Must be done before connect
             socket_.async_connect(*i, boost::bind(&AsioTcpSocket::connect_handler,
                                                   shared_from_this(),
                                                   asio::placeholders::error));
-#ifdef HAVE_ASIO_SSL_HPP
         }
-#endif /* HAVE_ASIO_SSL_HPP */
         state_ = S_CONNECTING;
     }
     catch (asio::system_error& e)
     {
-        gu_throw_error(e.code().value())
-            << "error while connecting to remote host "
+        std::ostringstream msg;
+        msg << "error while connecting to remote host "
             << uri.to_string()
             << "', asio error '" << e.what() << "'";
+        log_warn << msg.str();
+        gu_throw_error(e.code().value()) << msg.str();
     }
 }
 
@@ -231,10 +282,18 @@ void gcomm::AsioTcpSocket::close()
     }
 }
 
+// Enable to introduce random errors for write handler
+// #define GCOMM_ASIO_TCP_SIMULATE_WRITE_HANDLER_ERROR
 
 void gcomm::AsioTcpSocket::write_handler(const asio::error_code& ec,
                                          size_t bytes_transferred)
 {
+#ifdef GCOMM_ASIO_TCP_SIMULATE_WRITE_HANDLER_ERROR
+    static const long empty_rate(10000);
+    static const long bytes_transferred_less_than_rate(10000);
+    static const long bytes_transferred_not_zero_rate(10000);
+#endif // GCOMM_ASIO_TCP_SIMULATE_WRITE_HANDLER_ERROR
+
     Critical<AsioProtonet> crit(net_);
 
     if (state() != S_CONNECTED && state() != S_CLOSING)
@@ -254,34 +313,70 @@ void gcomm::AsioTcpSocket::write_handler(const asio::error_code& ec,
 
     if (!ec)
     {
-        gcomm_assert(send_q_.empty() == false);
-        gcomm_assert(send_q_.front().len() >= bytes_transferred);
-
-        while (send_q_.empty() == false &&
-               bytes_transferred >= send_q_.front().len())
+        if (send_q_.empty() == true
+#ifdef GCOMM_ASIO_TCP_SIMULATE_WRITE_HANDLER_ERROR
+            || ::rand() % empty_rate == 0
+#endif // GCOMM_ASIO_TCP_SIMULATE_WRITE_HANDLER_ERROR
+            )
         {
-            const Datagram& dg(send_q_.front());
-            bytes_transferred -= dg.len();
-            send_q_.pop_front();
+            log_warn << "write_handler() called with empty send_q_. "
+                     << "Transport may not be reliable, closing the socket";
+            FAILED_HANDLER(asio::error_code(EPROTO,
+                                            asio::error::system_category));
         }
-        gcomm_assert(bytes_transferred == 0);
-
-        if (send_q_.empty() == false)
+        else if (send_q_.front().len() < bytes_transferred
+#ifdef GCOMM_ASIO_TCP_SIMULATE_WRITE_HANDLER_ERROR
+                 || ::rand() % bytes_transferred_less_than_rate == 0
+#endif // GCOMM_ASIO_TCP_SIMULATE_WRITE_HANDLER_ERROR
+            )
         {
-            const Datagram& dg(send_q_.front());
-            boost::array<asio::const_buffer, 2> cbs;
-            cbs[0] = asio::const_buffer(dg.header()
-                                        + dg.header_offset(),
-                                        dg.header_len());
-            cbs[1] = asio::const_buffer(&dg.payload()[0],
-                                        dg.payload().size());
-            write_one(cbs);
+            log_warn << "write_handler() bytes_transferred "
+                     << bytes_transferred
+                     << " less than sent "
+                     << send_q_.front().len()
+                     << ". Transport may not be reliable, closing the socket";
+            FAILED_HANDLER(asio::error_code(EPROTO,
+                                            asio::error::system_category));
         }
-        else if (state_ == S_CLOSING)
+        else
         {
-            log_debug << "deferred close of " << id();
-            close_socket();
-            state_ = S_CLOSED;
+            while (send_q_.empty() == false &&
+                   bytes_transferred >= send_q_.front().len())
+            {
+                const Datagram& dg(send_q_.front());
+                bytes_transferred -= dg.len();
+                send_q_.pop_front();
+            }
+            if (bytes_transferred != 0
+#ifdef GCOMM_ASIO_TCP_SIMULATE_WRITE_HANDLER_ERROR
+                || ::rand() % bytes_transferred_not_zero_rate == 0
+#endif // GCOMM_ASIO_TCP_SIMULATE_WRITE_HANDLER_ERROR
+                )
+            {
+                log_warn << "write_handler() bytes_transferred "
+                         << bytes_transferred
+                         << " after processing the send_q_. "
+                         << "Transport may not be reliable, closing the socket";
+                FAILED_HANDLER(asio::error_code(EPROTO,
+                                                asio::error::system_category));
+            }
+            else if (send_q_.empty() == false)
+            {
+                const Datagram& dg(send_q_.front());
+                gu::array<asio::const_buffer, 2>::type cbs;
+                cbs[0] = asio::const_buffer(dg.header()
+                                            + dg.header_offset(),
+                                            dg.header_len());
+                cbs[1] = asio::const_buffer(dg.payload().data(),
+                                            dg.payload().size());
+                write_one(cbs);
+            }
+            else if (state_ == S_CLOSING)
+            {
+                log_debug << "deferred close of " << id();
+                close_socket();
+                state_ = S_CLOSED;
+            }
         }
     }
     else if (state_ == S_CLOSING)
@@ -299,21 +394,17 @@ void gcomm::AsioTcpSocket::write_handler(const asio::error_code& ec,
 void gcomm::AsioTcpSocket::set_option(const std::string& key,
                                       const std::string& val)
 {
-    if (key == Conf::SocketRecvBufSize)
-    {
-        size_t llval;
-        gu_trace(llval = Conf::check_recv_buf_size(val));
-        socket().set_option(asio::socket_base::receive_buffer_size(llval));
-#if GCOMM_CHECK_RECV_BUF_SIZE
-        check_socket_option<asio::socket_base::receive_buffer_size>
-            (key, llval);
-#endif
-    }
+    // Currently adjustable socket.recv_buf_size and socket.send_buf_size
+    // bust be set before the connection is established, so the runtime
+    // setting will not be effective.
+    log_warn << "Setting " << key << " in run time does not have effect, "
+             << "please set the configuration in provider options "
+             << "and restart";
 }
 
 namespace gcomm
 {
-    typedef boost::shared_ptr<gcomm::AsioTcpSocket> AsioTcpSocketPtr;
+    typedef gu::shared_ptr<gcomm::AsioTcpSocket>::type AsioTcpSocketPtr;
     class AsioPostForSendHandler
     {
     public:
@@ -323,15 +414,21 @@ namespace gcomm
         { }
         void operator()()
         {
-            if (socket_->state() == gcomm::Socket::S_CONNECTED &&
+            Critical<AsioProtonet> crit(socket_->net_);
+            // Send queue is processed also in closing state
+            // in order to deliver as many messages as possible,
+            // even if the socket has been discarded by
+            // upper layers.
+            if ((socket_->state() == gcomm::Socket::S_CONNECTED ||
+                 socket_->state() == gcomm::Socket::S_CLOSING) &&
                 socket_->send_q_.empty() == false)
             {
                 const gcomm::Datagram& dg(socket_->send_q_.front());
-                boost::array<asio::const_buffer, 2> cbs;
+                gu::array<asio::const_buffer, 2>::type cbs;
                 cbs[0] = asio::const_buffer(dg.header()
                                             + dg.header_offset(),
                                             dg.header_len());
-                cbs[1] = asio::const_buffer(&dg.payload()[0],
+                cbs[1] = asio::const_buffer(dg.payload().data(),
                                             dg.payload().size());
                 socket_->write_one(cbs);
             }
@@ -341,13 +438,18 @@ namespace gcomm
     };
 }
 
-int gcomm::AsioTcpSocket::send(const Datagram& dg)
+int gcomm::AsioTcpSocket::send(int segment, const Datagram& dg)
 {
     Critical<AsioProtonet> crit(net_);
 
     if (state() != S_CONNECTED)
     {
         return ENOTCONN;
+    }
+
+    if (send_q_.size() >= max_send_q_bytes)
+    {
+        return ENOBUFS;
     }
 
     NetHeader hdr(static_cast<uint32_t>(dg.len()), net_.version_);
@@ -357,16 +459,16 @@ int gcomm::AsioTcpSocket::send(const Datagram& dg)
         hdr.set_crc32(crc32(net_.checksum_, dg), net_.checksum_);
     }
 
-    send_q_.push_back(dg); // makes copy of dg
-    Datagram& priv_dg(send_q_.back());
-
+    last_queued_tstamp_ = gu::datetime::Date::monotonic();
+    // Make copy of datagram to be able to adjust the header
+    Datagram priv_dg(dg);
     priv_dg.set_header_offset(priv_dg.header_offset() -
                               NetHeader::serial_size_);
     serialize(hdr,
               priv_dg.header(),
               priv_dg.header_size(),
               priv_dg.header_offset());
-
+    send_q_.push_back(segment, priv_dg);
     if (send_q_.size() == 1)
     {
         net_.io_service_.post(AsioPostForSendHandler(shared_from_this()));
@@ -446,6 +548,7 @@ void gcomm::AsioTcpSocket::read_handler(const asio::error_code& ec,
                 }
             }
             ProtoUpMeta um;
+            last_delivered_tstamp_ = gu::datetime::Date::monotonic();
             net_.dispatch(id(), dg, um);
             recv_offset_ -= NetHeader::serial_size_ + hdr.len();
 
@@ -462,7 +565,7 @@ void gcomm::AsioTcpSocket::read_handler(const asio::error_code& ec,
         }
     }
 
-    boost::array<asio::mutable_buffer, 1> mbs;
+    gu::array<asio::mutable_buffer, 1>::type mbs;
     mbs[0] = asio::mutable_buffer(&recv_buf_[0] + recv_offset_,
                                   recv_buf_.size() - recv_offset_);
     read_one(mbs);
@@ -524,7 +627,7 @@ void gcomm::AsioTcpSocket::async_receive()
 
     gcomm_assert(state() == S_CONNECTED);
 
-    boost::array<asio::mutable_buffer, 1> mbs;
+    gu::array<asio::mutable_buffer, 1>::type mbs;
 
     mbs[0] = asio::mutable_buffer(&recv_buf_[0], recv_buf_.size());
     read_one(mbs);
@@ -547,37 +650,22 @@ std::string gcomm::AsioTcpSocket::remote_addr() const
     return remote_addr_;
 }
 
-
 void gcomm::AsioTcpSocket::set_socket_options()
 {
     basic_socket_t& sock(socket());
-
     gu::set_fd_options(sock);
     sock.set_option(asio::ip::tcp::no_delay(true));
-
-    size_t const recv_buf_size
-        (net_.conf().get<size_t>(gcomm::Conf::SocketRecvBufSize));
-    assert(ssize_t(recv_buf_size) >= 0); // this should have been checked already
-    sock.set_option(asio::socket_base::receive_buffer_size(recv_buf_size));
-
-#if GCOMM_CHECK_RECV_BUF_SIZE
-    size_t new_val(check_socket_option<asio::socket_base::receive_buffer_size>
-                   (gcomm::Conf::SocketRecvBufSize, recv_buf_size));
-    if (new_val < recv_buf_size)
-    {
-        // apparently there's a limit
-        net_.conf().set(gcomm::Conf::SocketRecvBufSize, new_val);
-    }
-#else
-    asio::socket_base::receive_buffer_size option;
-    sock.get_option(option);
-    log_debug << "socket recv buf size " << option.value();
-#endif
 }
 
-void gcomm::AsioTcpSocket::read_one(boost::array<asio::mutable_buffer, 1>& mbs)
+void gcomm::AsioTcpSocket::set_buf_sizes()
 {
-#ifdef HAVE_ASIO_SSL_HPP
+    set_recv_buf_size_helper(net_.conf(), socket());
+    set_send_buf_size_helper(net_.conf(), socket());
+}
+
+void gcomm::AsioTcpSocket::read_one(
+    gu::array<asio::mutable_buffer, 1>::type& mbs)
+{
     if (ssl_socket_ != 0)
     {
         async_read(*ssl_socket_, mbs,
@@ -592,7 +680,6 @@ void gcomm::AsioTcpSocket::read_one(boost::array<asio::mutable_buffer, 1>& mbs)
     }
     else
     {
-#endif /* HAVE_ASIO_SSL_HPP */
         async_read(socket_, mbs,
                    boost::bind(&AsioTcpSocket::read_completion_condition,
                                shared_from_this(),
@@ -602,16 +689,13 @@ void gcomm::AsioTcpSocket::read_one(boost::array<asio::mutable_buffer, 1>& mbs)
                                shared_from_this(),
                                asio::placeholders::error,
                                asio::placeholders::bytes_transferred));
-#ifdef HAVE_ASIO_SSL_HPP
     }
-#endif /* HAVE_ASIO_SSL_HPP */
 }
 
 
 void gcomm::AsioTcpSocket::write_one(
-    const boost::array<asio::const_buffer, 2>& cbs)
+    const gu::array<asio::const_buffer, 2>::type& cbs)
 {
-#ifdef HAVE_ASIO_SSL_HPP
     if (ssl_socket_ != 0)
     {
         async_write(*ssl_socket_, cbs,
@@ -622,15 +706,12 @@ void gcomm::AsioTcpSocket::write_one(
     }
     else
     {
-#endif /* HAVE_ASIO_SSL_HPP */
         async_write(socket_, cbs,
                     boost::bind(&AsioTcpSocket::write_handler,
                                 shared_from_this(),
                                 asio::placeholders::error,
                                 asio::placeholders::bytes_transferred));
-#ifdef HAVE_ASIO_SSL_HPP
     }
-#endif /* HAVE_ASIO_SSL_HPP */
 }
 
 
@@ -638,7 +719,6 @@ void gcomm::AsioTcpSocket::close_socket()
 {
     try
     {
-#ifdef HAVE_ASIO_SSL_HPP
         if (ssl_socket_ != 0)
         {
             // close underlying transport before calling shutdown()
@@ -648,18 +728,14 @@ void gcomm::AsioTcpSocket::close_socket()
         }
         else
         {
-#endif /* HAVE_ASIO_SSL_HPP */
             socket_.close();
-#ifdef HAVE_ASIO_SSL_HPP
         }
-#endif /* HAVE_ASIO_SSL_HPP */
     }
     catch (...) { }
 }
 
 void gcomm::AsioTcpSocket::assign_local_addr()
 {
-#ifdef HAVE_ASIO_SSL_HPP
     if (ssl_socket_ != 0)
     {
         local_addr_ = gcomm::uri_string(
@@ -672,20 +748,16 @@ void gcomm::AsioTcpSocket::assign_local_addr()
     }
     else
     {
-#endif /* HAVE_ASIO_SSL_HPP */
         local_addr_ = gcomm::uri_string(
             gu::scheme::tcp,
             gu::escape_addr(socket_.local_endpoint().address()),
             gu::to_string(socket_.local_endpoint().port())
             );
-#ifdef HAVE_ASIO_SSL_HPP
     }
-#endif /* HAVE_ASIO_SSL_HPP */
 }
 
 void gcomm::AsioTcpSocket::assign_remote_addr()
 {
-#ifdef HAVE_ASIO_SSL_HPP
     if (ssl_socket_ != 0)
     {
         remote_addr_ = gcomm::uri_string(
@@ -698,18 +770,52 @@ void gcomm::AsioTcpSocket::assign_remote_addr()
     }
     else
     {
-#endif /* HAVE_ASIO_SSL_HPP */
         remote_addr_ = uri_string(
             gu::scheme::tcp,
             gu::escape_addr(socket_.remote_endpoint().address()),
             gu::to_string(socket_.remote_endpoint().port())
             );
-#ifdef HAVE_ASIO_SSL_HPP
     }
-#endif /* HAVE_ASIO_SSL_HPP */
 }
 
-
+gcomm::SocketStats gcomm::AsioTcpSocket::stats() const
+{
+    SocketStats ret;
+#if defined(__linux__) || defined(__FreeBSD__)
+    struct tcp_info tcpi;
+    memset(&tcpi, 0, sizeof(tcpi));
+    socklen_t tcpi_len(sizeof(tcpi));
+    int native_fd(ssl_socket_ ?
+                  const_cast<basic_socket_t&>(ssl_socket_->lowest_layer()).native() :
+                  const_cast<asio::ip::tcp::socket&>(socket_).native());
+#if defined(__linux__)
+    int level(SOL_TCP);
+#else
+    int level(IPPROTO_TCP);
+#endif /* __linux__ */
+    if (getsockopt(native_fd, level, TCP_INFO, &tcpi, &tcpi_len) == 0)
+    {
+        ret.rtt            = tcpi.tcpi_rtt;
+        ret.rttvar         = tcpi.tcpi_rttvar;
+        ret.rto            = tcpi.tcpi_rto;
+#if defined(__linux__)
+        ret.lost           = tcpi.tcpi_lost;
+#else
+        ret.lost           = 0;
+#endif /* __linux__ */
+        ret.last_data_recv = tcpi.tcpi_last_data_recv;
+        ret.cwnd           = tcpi.tcpi_snd_cwnd;
+        gu::datetime::Date now(gu::datetime::Date::monotonic());
+        Critical<AsioProtonet> crit(net_);
+        ret.last_queued_since = (now - last_queued_tstamp_).get_nsecs();
+        ret.last_delivered_since = (now - last_delivered_tstamp_).get_nsecs();
+        ret.send_queue_length = send_q_.size();
+        ret.send_queue_bytes = send_q_.queued_bytes();
+        ret.send_queue_segments = send_q_.segments();
+    }
+#endif /* __linux__ || __FreeBSD__ */
+    return ret;
+}
 
 gcomm::AsioTcpAcceptor::AsioTcpAcceptor(AsioProtonet& net, const gu::URI& uri)
     :
@@ -739,7 +845,6 @@ void gcomm::AsioTcpAcceptor::accept_handler(
             s->assign_local_addr();
             s->assign_remote_addr();
             s->set_socket_options();
-#ifdef HAVE_ASIO_SSL_HPP
             if (s->ssl_socket_ != 0)
             {
                 log_debug << "socket "
@@ -755,11 +860,8 @@ void gcomm::AsioTcpAcceptor::accept_handler(
             }
             else
             {
-#endif /* HAVE_ASIO_SSL_HP */
                 s->state_ = Socket::S_CONNECTED;
-#ifdef HAVE_ASIO_SSL_HPP
             }
-#endif /* HAVE_ASIO_SSL_HPP */
             accepted_socket_ = socket;
             log_debug << "accepted socket " << socket->id();
             net_.dispatch(id(), Datagram(), ProtoUpMeta(error.value()));
@@ -771,34 +873,28 @@ void gcomm::AsioTcpAcceptor::accept_handler(
             log_debug << "accept failed: " << e.what();
         }
         AsioTcpSocket* new_socket(new AsioTcpSocket(net_, uri_));
-#ifdef HAVE_ASIO_SSL_HPP
         if (uri_.get_scheme() == gu::scheme::ssl)
         {
             new_socket->ssl_socket_ =
                 new asio::ssl::stream<asio::ip::tcp::socket>(
                     net_.io_service_, net_.ssl_context_);
-            acceptor_.async_accept(new_socket->ssl_socket_->lowest_layer(),
-                                   boost::bind(&AsioTcpAcceptor::accept_handler,
-                                               this,
-                                               SocketPtr(new_socket),
-                                               asio::placeholders::error));
         }
-        else
-        {
-#endif /* HAVE_ASIO_SSL_HPP */
-            acceptor_.async_accept(new_socket->socket_,
-                                   boost::bind(&AsioTcpAcceptor::accept_handler,
-                                               this,
-                                               SocketPtr(new_socket),
-                                               asio::placeholders::error));
-#ifdef HAVE_ASIO_SSL_HPP
-        }
-#endif /* HAVE_ASIO_SSL_HPP */
+        acceptor_.async_accept(new_socket->socket(),
+                               boost::bind(&AsioTcpAcceptor::accept_handler,
+                                           this,
+                                           SocketPtr(new_socket),
+                                           asio::placeholders::error));
     }
     else
     {
         log_warn << "accept handler: " << error;
     }
+}
+
+void gcomm::AsioTcpAcceptor::set_buf_sizes()
+{
+    set_recv_buf_size_helper(net_.conf(), acceptor_);
+    set_send_buf_size_helper(net_.conf(), acceptor_);
 }
 
 
@@ -816,39 +912,29 @@ void gcomm::AsioTcpAcceptor::listen(const gu::URI& uri)
         acceptor_.open(i->endpoint().protocol());
         acceptor_.set_option(asio::ip::tcp::socket::reuse_address(true));
         gu::set_fd_options(acceptor_);
+        set_buf_sizes(); // Must be done before listen
         acceptor_.bind(*i);
         acceptor_.listen();
         AsioTcpSocket* new_socket(new AsioTcpSocket(net_, uri));
-#ifdef HAVE_ASIO_SSL_HPP
         if (uri_.get_scheme() == gu::scheme::ssl)
         {
             new_socket->ssl_socket_ =
                 new asio::ssl::stream<asio::ip::tcp::socket>(
                     net_.io_service_, net_.ssl_context_);
-            acceptor_.async_accept(new_socket->ssl_socket_->lowest_layer(),
-                                   boost::bind(&AsioTcpAcceptor::accept_handler,
-                                               this,
-                                               SocketPtr(new_socket),
-                                               asio::placeholders::error));
         }
-        else
-        {
-#endif /* HAVE_ASIO_SSL_HPP */
-            acceptor_.async_accept(new_socket->socket_,
-                                   boost::bind(&AsioTcpAcceptor::accept_handler,
-                                               this,
-                                               SocketPtr(new_socket),
-                                               asio::placeholders::error));
-#ifdef HAVE_ASIO_SSL_HPP
-        }
-#endif /* HAVE_ASIO_SSL_HPP */
+        acceptor_.async_accept(new_socket->socket(),
+                               boost::bind(&AsioTcpAcceptor::accept_handler,
+                                           this,
+                                           SocketPtr(new_socket),
+                                           asio::placeholders::error));
     }
     catch (asio::system_error& e)
     {
-        log_error << e.what();
-        gu_throw_error(e.code().value())
-            << "error while trying to listen '" << uri.to_string()
+        std::ostringstream msg;
+        msg << "error while trying to listen '" << uri.to_string()
             << "', asio error '" << e.what() << "'";
+        log_warn << msg.str();
+        gu_throw_error(e.code().value()) << msg.str();
     }
 }
 

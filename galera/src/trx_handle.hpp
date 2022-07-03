@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2010-2016 Codership Oy <info@codership.com>
+// Copyright (C) 2010-2017 Codership Oy <info@codership.com>
 //
 
 
@@ -21,6 +21,7 @@
 #include "gu_utils.hpp"
 #include "gu_macros.hpp"
 #include "gu_mem_pool.hpp"
+#include "gu_limits.h" // page size stuff
 
 #include <set>
 
@@ -44,14 +45,24 @@ namespace galera
 
         struct Params
         {
-            std::string     working_dir_;
-            int             version_;
-            KeySet::Version key_format_;
-            int             max_write_set_size_;
-            Params (const std::string& wdir, int ver, KeySet::Version kformat,
-                    int max_write_set_size = WriteSetNG::MAX_SIZE) :
-                working_dir_(wdir), version_(ver), key_format_(kformat),
-                max_write_set_size_(max_write_set_size) {}
+            std::string            working_dir_;
+            int                    version_;
+            KeySet::Version        key_format_;
+            gu::RecordSet::Version record_set_ver_;
+            int                    max_write_set_size_;
+
+            Params (const std::string& wdir,
+                    int                ver,
+                    KeySet::Version    kformat,
+                    gu::RecordSet::Version rsv = gu::RecordSet::VER2,
+                    int                max_write_set_size = WriteSetNG::MAX_SIZE)
+                :
+                working_dir_       (wdir),
+                version_           (ver),
+                key_format_        (kformat),
+                record_set_ver_    (rsv),
+                max_write_set_size_(max_write_set_size)
+            {}
         };
 
         static const Params Defaults;
@@ -721,13 +732,17 @@ namespace galera
 
                 WriteSetOut* wso = &write_set_out();
                 assert(static_cast<void*>(wso) == static_cast<void*>(store));
+                assert((uintptr_t(wso) % GU_WORD_BYTES) == 0);
+                assert(params.version_ >= 0 &&
+                       params.version_ <= WriteSetNG::MAX_VERSION);
 
                 new (wso) WriteSetOut (params.working_dir_,
                                        trx_id_, params.key_format_,
                                        store      + sizeof(WriteSetOut),
                                        store_size - sizeof(WriteSetOut),
                                        0,
-                                       WriteSetNG::MAX_VERSION,
+                                       params.record_set_ver_,
+                                       WriteSetNG::Version(params.version_),
                                        DataSet::MAX_VERSION,
                                        DataSet::MAX_VERSION,
                                        params.max_write_set_size_);

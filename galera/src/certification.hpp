@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2010-2014 Codership Oy <info@codership.com>
+// Copyright (C) 2010-2018 Codership Oy <info@codership.com>
 //
 
 #ifndef GALERA_CERTIFICATION_HPP
@@ -24,6 +24,7 @@ namespace galera
     public:
 
         static std::string const PARAM_LOG_CONFLICTS;
+        static std::string const PARAM_OPTIMISTIC_PA;
 
         static void register_params(gu::Config&);
 
@@ -48,7 +49,7 @@ namespace galera
             TEST_FAILED
         } TestResult;
 
-        Certification(gu::Config& conf, ServiceThd& thd);
+        Certification(gu::Config& conf, ServiceThd& thd, gcache::GCache& gcache);
         ~Certification();
 
         void assign_initial_position(wsrep_seqno_t seqno, int versiono);
@@ -111,13 +112,13 @@ namespace galera
                 cert_index_ng_.bucket_count();
         }
 
-        void set_log_conflicts(const std::string& str);
+        void param_set(const std::string& key, const std::string& value);
 
     private:
 
         TestResult do_test(TrxHandle*, bool);
         TestResult do_test_v1to2(TrxHandle*, bool);
-        TestResult do_test_v3(TrxHandle*, bool);
+        TestResult do_test_v3to4(TrxHandle*, bool);
         TestResult do_test_preordered(TrxHandle*);
         void purge_for_trx(TrxHandle*);
         void purge_for_trx_v1to2(TrxHandle*);
@@ -184,11 +185,13 @@ namespace galera
         };
 
         int           version_;
+        gu::Config&   conf_;
         TrxMap        trx_map_;
         CertIndex     cert_index_;
         CertIndexNG   cert_index_ng_;
         DepsSet       deps_set_;
         ServiceThd&   service_thd_;
+        gcache::GCache& gcache_;
         gu::Mutex     mutex_;
         size_t        trx_size_warn_count_;
         wsrep_seqno_t initial_position_;
@@ -217,6 +220,7 @@ namespace galera
         unsigned int const max_length_check_; /* Mask how often to check */
 
         bool               log_conflicts_;
+        bool               optimistic_pa_;
     };
 }
 

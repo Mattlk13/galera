@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2010-2016 Codership Oy <info@codership.com>
+ * Copyright (C) 2010-2020 Codership Oy <info@codership.com>
  */
 
 /*! @file ring buffer storage class */
@@ -27,6 +27,7 @@ namespace gcache
                     size_t             size,
                     seqno2ptr_t&       seqno2ptr,
                     gu::UUID&          gid,
+                    int                dbg,
                     bool               recover);
 
         ~RingBuffer ();
@@ -113,10 +114,26 @@ namespace gcache
 
         size_t allocated_pool_size ();
 
+        void set_debug(int const dbg) { debug_ = dbg & DEBUG; }
+
+#ifdef GCACHE_RB_UNIT_TEST
+        ptrdiff_t offset(const void* const ptr) const
+        {
+            return static_cast<const uint8_t*>(ptr) - start_;
+        }
+#endif
+
     private:
 
         static size_t const PREAMBLE_LEN = 1024;
         static size_t const HEADER_LEN = 32;
+
+        // 0 - undetermined version
+        // 1 - initial version, no buffer alignment
+        // 2 - buffer alignemnt to GU_WORD_BYTES
+        static int    const VERSION = 2;
+
+        static int    const DEBUG = 2; // debug flag
 
         gu::FileDescriptor fd_;
         gu::MMap           mmap_;
@@ -135,6 +152,8 @@ namespace gcache
         size_t             size_free_;
         size_t             size_used_;
         size_t             size_trail_;
+
+        int                debug_;
 
         bool               open_;
 
@@ -155,8 +174,8 @@ namespace gcache
         void          close_preamble();
 
         // returns lower bound (not inclusive) of valid seqno range
-        int64_t       scan(off_t offset);
-        void          recover(off_t offset);
+        seqno_t       scan(off_t offset, int scan_step);
+        void          recover(off_t offset, int version);
 
         void          estimate_space();
 

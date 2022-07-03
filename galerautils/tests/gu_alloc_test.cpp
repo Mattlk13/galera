@@ -1,8 +1,9 @@
-// Copyright (C) 2013 Codership Oy <info@codership.com>
+// Copyright (C) 2013-2020 Codership Oy <info@codership.com>
 
 // $Id$
 
 #include "../src/gu_alloc.hpp"
+#include "../src/gu_arch.h"
 
 #include "gu_alloc_test.hpp"
 
@@ -19,7 +20,7 @@ public:
 START_TEST (basic)
 {
     ssize_t const extra_size(1 << 12); /* extra size to force new page */
-    gu::byte_t reserved[extra_size];
+    size_t reserved[extra_size / sizeof(size_t)]; /* size_t for alignment */
 
     const char test0[] = "test0";
     ssize_t const test0_size(sizeof(test0));
@@ -38,32 +39,32 @@ START_TEST (basic)
     r = 0; s += r;
     mark_point();
     p = a.alloc(r, n);
-    fail_if (p != 0);
-    fail_if (n);
-    fail_if (a.size() != s);
+    ck_assert(0 == p);
+    ck_assert(!n);
+    ck_assert(a.size() == s);
 
     r = test0_size; s += r;
     mark_point();
     p = a.alloc(r, n);
-    fail_if (0 == p);
-    fail_if (n);
-    fail_if (a.size() != s);
+    ck_assert(0 != p);
+    ck_assert(!n);
+    ck_assert(a.size() == s);
     strcpy (reinterpret_cast<char*>(p), test0);
 
     r = test1_size; s += r;
     mark_point();
     p = a.alloc(r, n);
-    fail_if (0 == p);
-    fail_if (!n);                            /* new page must be allocated */
-    fail_if (a.size() != s);
+    ck_assert(0 != p);
+    ck_assert(n);                            /* new page must be allocated */
+    ck_assert(a.size() == s);
     strcpy (reinterpret_cast<char*>(p), test1);
 
     r = 0; s += r;
     mark_point();
     p = a.alloc(r, n);
-    fail_if (p != 0);
-    fail_if (n);
-    fail_if (a.size() != s);
+    ck_assert(0 == p);
+    ck_assert(!n);
+    ck_assert(a.size() == s);
 
 #ifdef GU_ALLOCATOR_DEBUG
     std::vector<gu::Buf> out;
@@ -72,12 +73,12 @@ START_TEST (basic)
 
     size_t out_size = a.gather (out);
 
-    fail_if (out_size != test0_size + test1_size);
-    fail_if (out.size() != 2);
-    fail_if (out[0].size != test0_size);
-    fail_if (strcmp(reinterpret_cast<const char*>(out[0].ptr), test0));
-    fail_if (out[1].size != test1_size);
-    fail_if (strcmp(reinterpret_cast<const char*>(out[1].ptr), test1));
+    ck_assert(out_size == test0_size + test1_size);
+    ck_assert(out.size() == 2);
+    ck_assert(out[0].size == test0_size);
+    ck_assert(!strcmp(reinterpret_cast<const char*>(out[0].ptr), test0));
+    ck_assert(out[1].size == test1_size);
+    ck_assert(!strcmp(reinterpret_cast<const char*>(out[1].ptr), test1));
 #endif /* GU_ALLOCATOR_DEBUG */
 }
 END_TEST

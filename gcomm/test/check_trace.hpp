@@ -25,6 +25,8 @@
 
 gu::Config& check_trace_conf();
 
+extern "C" void check_trace_log_cb(int, const char*);
+
 namespace gcomm
 {
     class TraceMsg
@@ -215,6 +217,8 @@ namespace gcomm
             send_up(rb, um);
         }
 
+        void set_queueing(bool val) { queue_ = val; }
+
         int handle_down(Datagram& wb, const ProtoDownMeta& dm)
         {
             if (queue_ == true)
@@ -228,6 +232,8 @@ namespace gcomm
                 gu_trace(return send_down(wb, ProtoDownMeta(0xff, O_UNRELIABLE, uuid_)));
             }
         }
+
+        bool empty() const { return out_.empty(); }
 
         Datagram* out()
         {
@@ -268,14 +274,22 @@ namespace gcomm
 
         ~DummyNode()
         {
-            std::list<Protolay*>::iterator i, i_next;
-            i = i_next = protos_.begin();
-            for (++i_next; i_next != protos_.end(); ++i, ++i_next)
+            try
             {
-                gu_trace(gcomm::disconnect(*i, *i_next));
+                std::list<Protolay*>::iterator i, i_next;
+                i = i_next = protos_.begin();
+                for (++i_next; i_next != protos_.end(); ++i, ++i_next)
+                {
+                    gu_trace(gcomm::disconnect(*i, *i_next));
+                }
+                gu_trace(gcomm::disconnect(*i, this));
+                std::for_each(protos_.begin(), protos_.end(), gu::DeleteObject());
             }
-            gu_trace(gcomm::disconnect(*i, this));
-            std::for_each(protos_.begin(), protos_.end(), gu::DeleteObject());
+            catch(std::exception& e)
+            {
+                log_fatal << e.what();
+                abort();
+            }
         }
 
 
@@ -383,7 +397,7 @@ namespace gcomm
                 //         << rb.header_len();
                 if (available != 8)
                 {
-                    log_info << "check_trace fail";
+                    log_info << "check_trace fail: " << available;
                 }
                 gcomm_assert(available == 8);
                 int64_t seq;
@@ -534,7 +548,17 @@ namespace gcomm
     class PropagationMatrix
     {
     public:
-        PropagationMatrix() : tp_(), prop_() { }
+        PropagationMatrix() : tp_(), prop_()
+        {
+            // Some tests which deal with timer expiration require that
+            // the current time is far enough from zero. Start from
+            // 100 secs after zero, this should give enough headroom
+            // for all tests.
+            gu::datetime::SimClock::init(100*gu::datetime::Sec);
+            // Uncomment this to get logs with simulated timestamps.
+            // The low will be written into stderr.
+            // gu_log_cb = check_trace_log_cb;
+        }
         ~PropagationMatrix();
 
         void insert_tp(DummyNode* t);

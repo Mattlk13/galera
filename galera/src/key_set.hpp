@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2013 Codership Oy <info@codership.com>
+// Copyright (C) 2013-2018 Codership Oy <info@codership.com>
 //
 
 
@@ -43,15 +43,18 @@ public:
 
     static Version version (const std::string& ver);
 
+    static const char* type(wsrep_key_type_t const t);
+
     class Key
     {
     public:
-        enum Prefix
+        enum Prefix // this stays for backward compatibility
         {
             P_SHARED = 0,
-            P_EXCLUSIVE,
-            P_LAST = P_EXCLUSIVE
+            P_EXCLUSIVE
         };
+
+        static int const TYPE_MAX = WSREP_KEY_EXCLUSIVE;
     }; /* class Key */
 
     /* This class describes what commonly would be referred to as a "key".
@@ -66,17 +69,18 @@ public:
         static size_t const TMP_STORE_SIZE = 4096;
         static size_t const MAX_HASH_SIZE  = 16;
 
-        struct TmpStore { gu::byte_t buf[TMP_STORE_SIZE]; };
-        union  HashData { gu::byte_t buf[MAX_HASH_SIZE]; uint64_t align; };
+        union TmpStore { gu::byte_t buf[TMP_STORE_SIZE]; gu_word_t align; };
+        union HashData { gu::byte_t buf[MAX_HASH_SIZE];  gu_word_t align; };
 
         /* This ctor creates a serialized representation of a key in tmp store
          * from a key hash and optional annotation. */
         KeyPart (TmpStore&       tmp,
                  const HashData& hash,
-                 Version const   ver,
-                 bool const      exclusive,
                  const wsrep_buf_t* parts, /* for annotation */
-                 int const       part_num
+                 Version const   ver,
+                 int const       prefix,
+                 int const       part_num,
+                 int const       alignment
             )
             : data_(tmp.buf)
         {
@@ -86,7 +90,11 @@ public:
             int const key_size
                 (8 << (static_cast<unsigned int>(ver - FLAT16) <= 1));
 
-            memcpy (tmp.buf, hash.buf, key_size);
+            assert((key_size % alignment) == 0);
+            assert((uintptr_t(tmp.buf)  % GU_WORD_BYTES) == 0);
+            assert((uintptr_t(hash.buf) % GU_WORD_BYTES) == 0);
+
+            ::memcpy (tmp.buf, hash.buf, key_size);
 
             /*  use lower bits for header:  */
 
@@ -94,7 +102,8 @@ public:
             gu::byte_t b = tmp.buf[0] & (~HEADER_MASK);
 
             /* set prefix  */
-            if (exclusive) { b |= (Key::P_EXCLUSIVE & PREFIX_MASK); }
+            assert(prefix <= PREFIX_MASK);
+            b |= (prefix & PREFIX_MASK);
 
             /* set version */
             b |= (ver & VERSION_MASK) << PREFIX_BITS;
@@ -104,7 +113,9 @@ public:
             if (annotated(ver))
             {
                 store_annotation(parts, part_num,
-                                 tmp.buf + key_size,sizeof(tmp.buf) - key_size);
+                                 tmp.buf + key_size,
+                                 sizeof(tmp.buf) - key_size,
+                                 alignment);
             }
         }
 
@@ -119,19 +130,58 @@ public:
 
         explicit KeyPart (const gu::byte_t* ptr = NULL) : data_(ptr) {}
 
-        Key::Prefix prefix() const
+        /* converts wsrep key type to KeyPart "prefix" depending on writeset
+         * version */
+        static int prefix(wsrep_key_type_t const ws_type, int const ws_ver)
         {
-            gu::byte_t const p(data_[0] & PREFIX_MASK);
-
-            if (gu_likely(p <= Key::P_LAST))
-                return static_cast<Key::Prefix>(p);
-
-            throw_bad_prefix(p);
+            if (ws_ver >= 0 && ws_ver <= 4)
+            {
+                switch (ws_type)
+                {
+                case WSREP_KEY_SHARED:
+                    return 0;
+                case WSREP_KEY_SEMI:
+                    return 1;
+                case WSREP_KEY_EXCLUSIVE:
+                    return ws_ver < 4 ? KeySet::Key::P_EXCLUSIVE : 2;
+                }
+            }
+            assert(0);
+            throw_bad_type_version(ws_type, ws_ver);
         }
 
-        bool shared()       const { return prefix() == Key::P_SHARED; }
+        /* The return value is subject to interpretation based on the
+         * writeset version which is done in wsrep_type(int) method */
+        int prefix() const
+        {
+            return (data_[0] & PREFIX_MASK);
+        }
 
-        bool exclusive()    const { return prefix() == Key::P_EXCLUSIVE; }
+        wsrep_key_type_t wsrep_type(int const ws_ver) const
+        {
+            assert(ws_ver >= 0 && ws_ver <= 4);
+
+            wsrep_key_type_t ret;
+
+            switch (prefix())
+            {
+            case 0:
+                ret = WSREP_KEY_SHARED;
+                break;
+            case 1:
+                ret = ws_ver == 4 ? WSREP_KEY_SEMI : WSREP_KEY_EXCLUSIVE;
+                break;
+            case 2:
+                assert(ws_ver == 4);
+                ret = WSREP_KEY_EXCLUSIVE;
+                break;
+            default:
+                throw_bad_prefix(prefix());
+            }
+
+            assert(prefix() == prefix(ret, ws_ver));
+            return ret;
+        }
 
         static Version version(const gu::byte_t* const buf)
         {
@@ -173,6 +223,7 @@ public:
 #else
                 ret = (lhs[2] == rhs[2] && lhs[3] == rhs[3]);
 #endif /* WORDSIZE */
+                /* fall through */
             case FLAT8:
             case FLAT8A:
                 /* shift is to clear up the header */
@@ -295,13 +346,15 @@ public:
 
         static size_t
         store_annotation (const wsrep_buf_t* parts, int part_num,
-                          gu::byte_t* buf, int size);
+                          gu::byte_t* buf, int size, int alignment);
 
         static void
         print_annotation (std::ostream& os, const gu::byte_t* buf);
 
         static void
         throw_buffer_too_short (size_t expected, size_t got) GU_NORETURN;
+        static void
+        throw_bad_type_version (wsrep_key_type_t t, int v)   GU_NORETURN;
         static void
         throw_bad_prefix       (gu::byte_t p)                GU_NORETURN;
         static void
@@ -526,7 +579,9 @@ public:
                  KeySetOut&     store,
                  const KeyPart* parent,
                  const KeyData& kd,
-                 int const      part_num);
+                 int const      part_num,
+                 int const      ws_ver,
+                 int const      alignment);
 
         KeyPart (const KeyPart& k)
         :
@@ -563,11 +618,8 @@ public:
             return (size_ == s && !(::memcmp (value_, v, size_)));
         }
 
-        bool
-        exclusive () const { return (part_ && part_->exclusive()); }
-
-        bool
-        shared () const { return !exclusive(); }
+        int
+        prefix() const { return (part_ ? part_->prefix() : 0); }
 
         void
         acquire()
@@ -621,21 +673,26 @@ public:
     KeySetOut (gu::byte_t*             reserved,
                size_t                  reserved_size,
                const BaseName&         base_name,
-               KeySet::Version const   version)
+               KeySet::Version const   version,
+               gu::RecordSet::Version const rsv,
+               int const               ws_ver)
         :
         gu::RecordSetOut<KeySet::KeyPart> (
             reserved,
             reserved_size,
             base_name,
-            check_type      (version),
-            ks_to_rs_version(version)
+            check_type(version),
+            rsv
             ),
         added_(),
         prev_ (),
         new_  (),
-        version_(version)
+        version_(version),
+        ws_ver_(ws_ver)
     {
         assert (version_ != KeySet::EMPTY);
+        assert ((uintptr_t(reserved) % GU_WORD_BYTES) == 0);
+        assert (ws_ver <= 4);
         KeyPart zero(version_);
         prev_().push_back(zero);
     }
@@ -655,6 +712,7 @@ private:
     gu::Vector<KeyPart,5> prev_;
     gu::Vector<KeyPart,5> new_;
     KeySet::Version       version_;
+    int                   ws_ver_;
 
     static gu::RecordSet::CheckType
     check_type (KeySet::Version ver)
@@ -663,18 +721,6 @@ private:
         {
         case KeySet::EMPTY: break; /* Can't create EMPTY KeySetOut */
         default: return gu::RecordSet::CHECK_MMH128;
-        }
-
-        KeySet::throw_version(ver);
-    }
-
-    static gu::RecordSet::Version
-    ks_to_rs_version (KeySet::Version ver)
-    {
-        switch (ver)
-        {
-        case KeySet::EMPTY: break; /* Can't create EMPTY KeySetOut */
-        default: return gu::RecordSet::VER1;
         }
 
         KeySet::throw_version(ver);

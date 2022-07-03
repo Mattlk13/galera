@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2013 Codership Oy <info@codership.com>
+ * Copyright (C) 2008-2020 Codership Oy <info@codership.com>
  *
  * Queue (FIFO) class implementation
  *
@@ -16,13 +16,14 @@
 #define _DEFAULT_SOURCE
 
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
 
 #include "gu_assert.h"
 #include "gu_limits.h"
 #include "gu_mem.h"
-#include "gu_mutex.h"
+#include "gu_threads.h"
 #include "gu_log.h"
 #include "gu_fifo.h"
 
@@ -41,14 +42,17 @@ struct gu_fifo
     ulong alloc;
     long  get_wait;
     long  put_wait;
-    long long  q_len;
-    long long  q_len_samples;
+    long long q_len;
+    long long q_len_samples;
     uint  item_size;
     uint  used;
     uint  used_max;
     uint  used_min;
     int   get_err;
     bool  closed;
+#ifndef NDEBUG
+    bool  locked;
+#endif
 
     gu_mutex_t   lock;
     gu_cond_t    get_cond;
@@ -91,7 +95,7 @@ gu_fifo_t *gu_fifo_create (size_t length, size_t item_size)
 
         ull alloc_size = array_size + sizeof (gu_fifo_t);
 
-        if (alloc_size > (size_t)-1) {
+        if (sizeof(alloc_size) > sizeof(size_t) && alloc_size > SIZE_MAX) {
             gu_error ("Initial FIFO size %llu exceeds size_t range %zu",
                       alloc_size, (size_t)-1);
             return NULL;
@@ -99,7 +103,7 @@ gu_fifo_t *gu_fifo_create (size_t length, size_t item_size)
 
         ull max_size = array_len * row_size + alloc_size;
 
-        if (max_size > (size_t)-1) {
+        if (sizeof(max_size) > sizeof(size_t) && max_size > SIZE_MAX) {
             gu_error ("Maximum FIFO size %llu exceeds size_t range %zu",
                       max_size, (size_t)-1);
             return NULL;
@@ -147,18 +151,39 @@ gu_fifo_t *gu_fifo_create (size_t length, size_t item_size)
 }
 
 // defined as macro for proper line reporting
+#ifdef NDEBUG
 #define fifo_lock(q)                                    \
     if (gu_likely (0 == gu_mutex_lock (&q->lock))) {}   \
     else {                                              \
         gu_fatal ("Failed to lock queue");              \
         abort();                                        \
     }
+#else  /* NDEBUG */
+#define fifo_lock(q)                                    \
+    if (gu_likely (0 == gu_mutex_lock (&q->lock))) {    \
+        q->locked = true;                               \
+    }                                                   \
+    else {                                              \
+        gu_fatal ("Failed to lock queue");              \
+        abort();                                        \
+    }
+#endif /* NDEBUG */
 
 static inline int
 fifo_unlock (gu_fifo_t* q)
 {
+#ifndef NDEBUG
+    q->locked = false;
+#endif
     return -gu_mutex_unlock (&q->lock);
 }
+
+#ifndef NDEBUG
+bool gu_fifo_locked (gu_fifo_t* q)
+{
+    return q->locked;
+}
+#endif
 
 /* lock the queue */
 void gu_fifo_lock    (gu_fifo_t *q)
@@ -229,10 +254,15 @@ static inline int fifo_lock_get (gu_fifo_t *q)
     int ret = 0;
 
     fifo_lock(q);
-
     while (0 == ret && !(ret = q->get_err) && 0 == q->used) {
         q->get_wait++;
+#ifndef NDEBUG
+        q->locked = false;
+#endif
         ret = -gu_cond_wait (&q->get_cond, &q->lock);
+#ifndef NDEBUG
+        q->locked = true;
+#endif
     }
 
     return ret;
@@ -258,8 +288,14 @@ static inline int fifo_lock_put (gu_fifo_t *q)
 
     fifo_lock(q);
     while (0 == ret && q->used == q->length && !q->closed) {
+#ifndef NDEBUG
+        q->locked = false;
+#endif
         q->put_wait++;
         ret = -gu_cond_wait (&q->put_cond, &q->lock);
+#ifndef NDEBUG
+        q->locked = true;
+#endif
     }
 
     return ret;
@@ -303,8 +339,9 @@ void* gu_fifo_get_head (gu_fifo_t* q, int* err)
     }
 }
 
-/*! Advances FIFO head and unlocks FIFO. */
-void gu_fifo_pop_head (gu_fifo_t* q)
+/*! Unprotected helper for gu_fifo_pop_head() and gu_fifo_clear() */
+static inline
+void fifo_advance_head (gu_fifo_t* q)
 {
     if ((FIFO_COL(q, q->head) == q->col_mask) &&
         (FIFO_ROW(q, q->head) != FIFO_ROW(q, q->tail)))
@@ -323,6 +360,12 @@ void gu_fifo_pop_head (gu_fifo_t* q)
     if (gu_unlikely(q->used < q->used_min)) {
         q->used_min = q->used;
     }
+}
+
+/*! Advances FIFO head and unlocks FIFO. */
+void gu_fifo_pop_head (gu_fifo_t* q)
+{
+    fifo_advance_head(q);
 
     if (fifo_unlock_get(q)) {
         gu_fatal ("Failed to unlock queue to get item.");
@@ -445,6 +488,15 @@ void gu_fifo_stats_flush(gu_fifo_t* q)
     fifo_unlock (q);
 }
 
+void gu_fifo_clear(gu_fifo_t* q)
+{
+    fifo_lock (q);
+
+    while (q->used > 0) fifo_advance_head(q);
+
+    fifo_unlock (q);
+}
+
 /* destructor - would block until all members are dequeued */
 void gu_fifo_destroy   (gu_fifo_t *queue)
 {
@@ -524,6 +576,8 @@ char *gu_fifo_print (gu_fifo_t *queue)
 int
 gu_fifo_cancel_gets (gu_fifo_t* q)
 {
+    assert(q->locked);
+
     if (q->get_err && -ENODATA != q->get_err) {
         gu_error ("Attempt to cancel FIFO gets in state: %d (%s)",
                   q->get_err, strerror(-q->get_err));

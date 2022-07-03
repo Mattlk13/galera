@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2010-2014 Codership Oy <info@codership.com>
+// Copyright (C) 2010-2020 Codership Oy <info@codership.com>
 //
 
 #include "galera_common.hpp"
@@ -31,18 +31,7 @@ apply_trx_ws(void*                    recv_ctx,
     {
         try
         {
-            if (trx.is_toi())
-            {
-                log_debug << "Executing TO isolated action: " << trx;
-            }
-
             gu_trace(trx.apply(recv_ctx, apply_cb, meta));
-
-            if (trx.is_toi())
-            {
-                log_debug << "Done executing TO isolated action: "
-                         << trx.global_seqno();
-            }
             break;
         }
         catch (galera::ApplyException& e)
@@ -145,6 +134,7 @@ galera::ReplicatorSMM::ReplicatorSMM(const struct wsrep_init_args* args)
     safe_to_bootstrap_  (true),
     trx_params_         (config_.get(BASE_DIR), -1,
                          KeySet::version(config_.get(Param::key_format)),
+                         TrxHandle::Defaults.record_set_ver_,
                          gu::from_string<int>(config_.get(
                              Param::max_write_set_size))),
     uuid_               (WSREP_UUID_UNDEFINED),
@@ -177,7 +167,7 @@ galera::ReplicatorSMM::ReplicatorSMM(const struct wsrep_init_args* args)
     ist_prepared_       (false),
     ist_senders_        (gcs_, gcache_),
     wsdb_               (),
-    cert_               (config_, service_thd_),
+    cert_               (config_, service_thd_, gcache_),
     local_monitor_      (),
     apply_monitor_      (),
     commit_monitor_     (),
@@ -231,6 +221,7 @@ galera::ReplicatorSMM::ReplicatorSMM(const struct wsrep_init_args* args)
     state_.add_transition(Transition(S_JOINED, S_CLOSING));
     state_.add_transition(Transition(S_JOINED, S_CONNECTED));
     state_.add_transition(Transition(S_JOINED, S_SYNCED));
+    // the following is possible if one desync() immediately follows another
     state_.add_transition(Transition(S_JOINED, S_DONOR));
 
     state_.add_transition(Transition(S_SYNCED, S_CLOSING));
@@ -291,6 +282,7 @@ galera::ReplicatorSMM::~ReplicatorSMM()
     case S_SYNCED:
     case S_DONOR:
         close();
+        // fall through
     case S_CLOSING:
         // @todo wait that all users have left the building
     case S_CLOSED:
@@ -372,8 +364,6 @@ wsrep_status_t galera::ReplicatorSMM::close()
 
 wsrep_status_t galera::ReplicatorSMM::async_recv(void* recv_ctx)
 {
-    assert(recv_ctx != 0);
-
     if (state_() == S_CLOSED || state_() == S_CLOSING)
     {
         log_error <<"async recv cannot start, provider in closed/closing state";
@@ -388,6 +378,8 @@ wsrep_status_t galera::ReplicatorSMM::async_recv(void* recv_ctx)
 
     while (WSREP_OK == retval && state_() != S_CLOSING)
     {
+        GU_DBUG_SYNC_EXECUTE("before_async_recv_process_sync", sleep(5););
+
         ssize_t rc;
 
         while (gu_unlikely((rc = as_->process(recv_ctx, exit_loop))
@@ -401,7 +393,15 @@ wsrep_status_t galera::ReplicatorSMM::async_recv(void* recv_ctx)
 
         if (gu_unlikely(rc <= 0))
         {
-            retval = WSREP_CONN_FAIL;
+            if (GcsActionSource::INCONSISTENCY_CODE == rc)
+            {
+                st_.mark_corrupt();
+                retval = WSREP_FATAL;
+            }
+            else
+            {
+                retval = WSREP_CONN_FAIL;
+            }
         }
         else if (gu_unlikely(exit_loop == true))
         {
@@ -468,6 +468,12 @@ void galera::ReplicatorSMM::apply_trx(void* recv_ctx, TrxHandle* trx)
     wsrep_trx_meta_t meta = {{state_uuid_, trx->global_seqno() },
                              trx->depends_seqno()};
 
+    if (trx->is_toi())
+    {
+        log_debug << "Executing TO isolated action: " << *trx;
+        st_.mark_unsafe();
+    }
+
     gu_trace(apply_trx_ws(recv_ctx, apply_cb_, commit_cb_, *trx, meta));
     /* at this point any exception in apply_trx_ws() is fatal, not
      * catching anything. */
@@ -509,6 +515,13 @@ void galera::ReplicatorSMM::apply_trx(void* recv_ctx, TrxHandle* trx)
     trx->unordered(recv_ctx, unordered_cb_);
 
     apply_monitor_.leave(ao);
+
+    if (trx->is_toi())
+    {
+        log_debug << "Done executing TO isolated action: "
+                  << trx->global_seqno();
+        st_.mark_safe();
+    }
 
     trx->set_exit_loop(exit_loop);
 }
@@ -879,8 +892,8 @@ wsrep_status_t galera::ReplicatorSMM::replay_trx(TrxHandle* trx, void* trx_ctx)
         ApplyOrder ao(*trx);
         gu_trace(apply_monitor_.enter(ao));
         trx->set_state(TrxHandle::S_MUST_REPLAY_CM);
-        // fall through
     }
+    // fall through
     case TrxHandle::S_MUST_REPLAY_CM:
         if (co_mode_ != CommitOrder::BYPASS)
         {
@@ -926,6 +939,13 @@ wsrep_status_t galera::ReplicatorSMM::replay_trx(TrxHandle* trx, void* trx_ctx)
             log_fatal << "Failed to re-apply trx: " << *trx;
             log_fatal << e.what();
             log_fatal << "Node consistency compromized, aborting...";
+
+            /* Before doing a graceful exit ensure that node isolate itself
+            from the cluster. This will cause the quorum to re-evaluate
+            and if minority nodes are left with different set of data
+            they can turn non-Primary to avoid further data consistency issue. */
+            param_set("gmcast.isolate", "1");
+
             abort();
         }
 
@@ -998,12 +1018,19 @@ wsrep_status_t galera::ReplicatorSMM::post_rollback(TrxHandle* trx)
 
 wsrep_status_t galera::ReplicatorSMM::causal_read(wsrep_gtid_t* gtid)
 {
-    wsrep_seqno_t cseq(static_cast<wsrep_seqno_t>(gcs_.caused()));
+    wsrep_seqno_t cseq;
+    gu::datetime::Date wait_until(gu::datetime::Date::calendar() +
+                                  causal_read_timeout_);
 
-    if (cseq < 0)
+    try
     {
-        log_warn << "gcs_caused() returned " << cseq << " (" << strerror(-cseq)
-                 << ')';
+        gcs_.caused(cseq, wait_until);
+        assert(cseq >= 0);
+    }
+    catch (gu::Exception& e)
+    {
+        log_warn << "gcs_caused() returned " << -e.get_errno()
+                 << " (" << strerror(e.get_errno()) << ")";
         return WSREP_TRX_FAIL;
     }
 
@@ -1016,8 +1043,6 @@ wsrep_status_t galera::ReplicatorSMM::causal_read(wsrep_gtid_t* gtid)
         // at monitor drain and disallowing further waits until
         // configuration change related operations (SST etc) have been
         // finished.
-        gu::datetime::Date wait_until(gu::datetime::Date::calendar()
-                                      + causal_read_timeout_);
         if (gu_likely(co_mode_ != CommitOrder::BYPASS))
         {
             commit_monitor_.wait(cseq, wait_until);
@@ -1133,8 +1158,9 @@ writeset_from_handle (wsrep_po_handle_t& handle,
 //                gu::String<256>(trx_params.working_dir_) << '/' << &handle,
                 trx_params.working_dir_, wsrep_trx_id_t(&handle),
                 /* key format is not essential since we're not adding keys */
-                KeySet::version(trx_params.key_format_), NULL, 0,
-                0, WriteSetNG::MAX_VERSION, DataSet::MAX_VERSION, DataSet::MAX_VERSION,
+                KeySet::version(trx_params.key_format_), NULL, 0, 0,
+                trx_params.record_set_ver_,
+                WriteSetNG::MAX_VERSION, DataSet::MAX_VERSION, DataSet::MAX_VERSION,
                 trx_params.max_write_set_size_);
 
             handle.opaque = ret;
@@ -1231,6 +1257,13 @@ galera::ReplicatorSMM::sst_sent(const wsrep_gtid_t& state_id, int const rcode)
     if (state_() != S_DONOR)
     {
         log_error << "sst sent called when not SST donor, state " << state_();
+        /* If sst-sent fails node should restore itself back to joined state.
+        sst-sent can fail commonly due to n/w error where-in DONOR may loose
+        connectivity to JOINER (or existing cluster) but on re-join it should
+        restore the original state (DONOR->JOINER->JOINED->SYNCED) without
+        waiting for JOINER. sst-failure on JOINER will gracefully shutdown the
+        joiner. */
+        gcs_.join_notification();
         return WSREP_CONN_FAIL;
     }
 
@@ -1280,7 +1313,14 @@ void galera::ReplicatorSMM::process_trx(void* recv_ctx, TrxHandle* trx)
 
             log_fatal << "Failed to apply trx: " << *trx;
             log_fatal << e.what();
-            log_fatal << "Node consistency compromized, aborting...";
+            log_fatal << "Node consistency compromised, aborting...";
+
+            /* Before doing a graceful exit ensure that node isolate itself
+            from the cluster. This will cause the quorum to re-evaluate
+            and if minority nodes are left with different set of data
+            they can turn non-Primary to avoid further data consistency issue. */
+            param_set("gmcast.isolate", "1");
+
             abort();
         }
         break;
@@ -1317,6 +1357,8 @@ void galera::ReplicatorSMM::process_commit_cut(wsrep_seqno_t seq,
 
 void galera::ReplicatorSMM::establish_protocol_versions (int proto_ver)
 {
+    trx_params_.record_set_ver_ = gu::RecordSet::VER1;
+
     switch (proto_ver)
     {
     case 1:
@@ -1345,6 +1387,18 @@ void galera::ReplicatorSMM::establish_protocol_versions (int proto_ver)
         // Protocol upgrade to handle IST SSL backwards compatibility,
         // no effect to TRX or STR protocols.
         trx_params_.version_ = 3;
+        str_proto_ver_ = 2;
+        break;
+    case 8:
+        // Protocol upgrade to enforce 8-byte alignment in writesets.
+        trx_params_.version_ = 3;
+        trx_params_.record_set_ver_ = gu::RecordSet::VER2;
+        str_proto_ver_ = 2;
+        break;
+    case 9:
+        // Protocol upgrade to enable support for semi-shared key type.
+        trx_params_.version_ = 4;
+        trx_params_.record_set_ver_ = gu::RecordSet::VER2;
         str_proto_ver_ = 2;
         break;
     default:
@@ -1405,6 +1459,7 @@ galera::ReplicatorSMM::process_conf_change(void*                    recv_ctx,
                                            State                    next_state,
                                            wsrep_seqno_t            seqno_l)
 {
+    assert(repl_proto >= 0 || view_info.status != WSREP_VIEW_PRIMARY);
     assert(seqno_l > -1);
 
     update_incoming_list(view_info);
@@ -1451,6 +1506,9 @@ galera::ReplicatorSMM::process_conf_change(void*                    recv_ctx,
         if (S_CONNECTED != state_()) state_.shift_to(S_CONNECTED);
     }
 
+    // must establish protocols before calling view_cb()
+    if (view_info.view >= 0) establish_protocol_versions (repl_proto);
+
     void*  app_req(0);
     size_t app_req_len(0);
 
@@ -1479,7 +1537,7 @@ galera::ReplicatorSMM::process_conf_change(void*                    recv_ctx,
 
     if (view_info.view >= 0) // Primary configuration
     {
-        establish_protocol_versions (repl_proto);
+        GU_DBUG_SYNC_WAIT("process_primary_configuration");
 
         // we have to reset cert initial position here, SST does not contain
         // cert index yet (see #197).
@@ -1578,7 +1636,7 @@ galera::ReplicatorSMM::process_conf_change(void*                    recv_ctx,
              */
             try {
                 gcs_.join(sst_seqno_);
-                sst_state_ = SST_NONE;
+                sst_state_ = SST_JOIN_SENT;
             }
             catch (gu::Exception& e)
             {
@@ -1589,7 +1647,7 @@ galera::ReplicatorSMM::process_conf_change(void*                    recv_ctx,
     else
     {
         // Non-primary configuration
-        if (state_uuid_ != WSREP_UUID_UNDEFINED)
+        if (state_uuid_ != WSREP_UUID_UNDEFINED && next_state == S_CLOSING)
         {
             st_.set (state_uuid_, STATE_SEQNO(), safe_to_bootstrap_);
         }
@@ -1635,6 +1693,7 @@ void galera::ReplicatorSMM::process_join(wsrep_seqno_t seqno_j,
     else
     {
         state_.shift_to(S_JOINED);
+        sst_state_ = SST_NONE;
     }
 
     local_monitor_.leave(lo);
@@ -1694,10 +1753,10 @@ wsrep_seqno_t galera::ReplicatorSMM::pause()
 
 void galera::ReplicatorSMM::resume()
 {
-    assert(pause_seqno_ != WSREP_SEQNO_UNDEFINED);
     if (pause_seqno_ == WSREP_SEQNO_UNDEFINED)
     {
-        gu_throw_error(EALREADY) << "tried to resume unpaused provider";
+        log_warn << "tried to resume unpaused provider";
+        return;
     }
 
     st_.set(state_uuid_, WSREP_SEQNO_UNDEFINED, safe_to_bootstrap_);
@@ -1790,57 +1849,46 @@ wsrep_status_t galera::ReplicatorSMM::cert(TrxHandle* trx)
     }
 
     wsrep_status_t retval(WSREP_OK);
+    // IST should have drained the monitors, so STATE_SEQNO() should be current
     bool const applicable(trx->global_seqno() > STATE_SEQNO());
+
+    if (!applicable)
+    {
+        // this can happen after state transfer position has been submitted
+        // but not all actions preceding it have been processed
+        trx->set_state(TrxHandle::S_MUST_ABORT);
+        gcache_.free(const_cast<void*>(trx->action()));
+        if (interrupted)
+            local_monitor_.self_cancel(lo);
+        else
+            local_monitor_.leave(lo);
+        return WSREP_TRX_FAIL;
+    }
 
     if (gu_likely (!interrupted))
     {
         switch (cert_.append_trx(trx))
         {
         case Certification::TEST_OK:
-            if (gu_likely(applicable))
+            if (trx->state() == TrxHandle::S_CERTIFYING)
             {
-                if (trx->state() == TrxHandle::S_CERTIFYING)
-                {
-                    retval = WSREP_OK;
-                }
-                else
-                {
-                    assert(trx->state() == TrxHandle::S_MUST_ABORT);
-                    trx->set_state(TrxHandle::S_MUST_REPLAY_AM);
-                    retval = WSREP_BF_ABORT;
-                }
+                retval = WSREP_OK;
             }
             else
             {
-                // this can happen after SST position has been submitted
-                // but not all actions preceding SST initial position
-                // have been processed
-                trx->set_state(TrxHandle::S_MUST_ABORT);
-                retval = WSREP_TRX_FAIL;
+                assert(trx->state() == TrxHandle::S_MUST_ABORT);
+                trx->set_state(TrxHandle::S_MUST_REPLAY_AM);
+                retval = WSREP_BF_ABORT;
             }
             break;
         case Certification::TEST_FAILED:
-            if (gu_unlikely(trx->is_toi() && applicable)) // small sanity check
-            {
-                // In some rare scenarios (e.g., when we have multiple
-                // transactions awaiting certification, and the last
-                // node remaining in the cluster becomes PRIMARY due
-                // to the failure of the previous primary node and
-                // the assign_initial_position() was called), sequence
-                // number mismatch occurs on configuration change and
-                // then certification was failed. We cannot move server
-                // forward (with last_seen_seqno < initial_position,
-                // see galera::Certification::do_test() for details)
-                // to avoid potential data loss, and hence will have
-                // to shut it down. Before shutting it down, we need
-                // to mark state as unsafe to trigger SST at next
-                // server restart.
-                log_fatal << "Certification failed for TO isolated action: "
+            if (gu_unlikely(trx->is_toi())) // small sanity check
+                log_info << "Certification failed for TO isolated action: "
                           << *trx;
-                st_.mark_unsafe();
-                local_monitor_.leave(lo);
-                abort();
-            }
+            else
+                log_debug << "Certification failed for replicated action: "
+                          << *trx;
+
             local_cert_failures_ += trx->is_local();
             trx->set_state(TrxHandle::S_MUST_ABORT);
             retval = WSREP_TRX_FAIL;
@@ -1878,12 +1926,14 @@ wsrep_status_t galera::ReplicatorSMM::cert(TrxHandle* trx)
         }
     }
 
-    if (gu_unlikely(WSREP_TRX_FAIL == retval && applicable))
+    if (gu_unlikely(WSREP_TRX_FAIL == retval))
     {
         // applicable but failed certification: self-cancel monitors
         apply_monitor_.self_cancel(ao);
         if (co_mode_ != CommitOrder::BYPASS) commit_monitor_.self_cancel(co);
     }
+
+    assert(applicable);
 
     return retval;
 }
@@ -1946,9 +1996,12 @@ galera::ReplicatorSMM::update_state_uuid (const wsrep_uuid_t& uuid,
         *(const_cast<wsrep_uuid_t*>(&state_uuid_)) = uuid;
 
         std::ostringstream os; os << state_uuid_;
-
-        strncpy(const_cast<char*>(state_uuid_str_), os.str().c_str(),
-                sizeof(state_uuid_str_));
+        // Copy only non-nil terminated part of the source string
+        // and terminate the string explicitly to silence a warning
+        // generated by Wstringop-truncation
+        char* str(const_cast<char*>(state_uuid_str_));
+        strncpy(str, os.str().c_str(), sizeof(state_uuid_str_) - 1);
+        str[sizeof(state_uuid_str_) - 1] = '\0';
     }
 
     st_.set(uuid, seqno, safe_to_bootstrap_);
